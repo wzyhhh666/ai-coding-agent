@@ -1,0 +1,26 @@
+{
+  "name": "coding-agent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types agent.ts",
+    "test": "node --experimental-strip-types --test \"tests/**/*.test.ts\"",
+    "test:sandbox:windows": "node --experimental-strip-types --test tests/windows_wsl_sandbox.integration.test.ts",
+    "test:sandbox": "RUN_MACOS_SANDBOX_TESTS=1 node --experimental-strip-types --test tests/macos_sandbox.integration.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ajv": "^8.20.0",
+    "diff": "^9.0.0",
+    "openai": "^6.45.0",
+    "smol-toml": "^1.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^6.0.3"
+  }
+}

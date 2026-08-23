@@ -1,0 +1,95 @@
+{
+  "permissions": {
+    "edit_file": "ask",
+    "read_file": "allow",
+    "run_command": "ask",
+    "search_files": "allow",
+    "write_file": "ask"
+  },
+  "tools": [
+    {
+      "name": "read_file",
+      "module": "tools.read_file",
+      "function": "read_file",
+      "description": "读取工作区内 UTF-8 文本文件的指定行范围。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "start_line": { "type": "integer", "minimum": 1 },
+          "max_lines": { "type": "integer", "minimum": 1 }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "write_file",
+      "module": "tools.write_file",
+      "function": "write_file",
+      "description": "创建或完整覆盖工作区内的 UTF-8 文本文件。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "content": { "type": "string" }
+        },
+        "required": ["path", "content"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "run_command",
+      "module": "tools.run_command",
+      "function": "run_command",
+      "description": "运行一次非 Shell 终端命令，可提供标准输入，返回 stdout、stderr 和退出码。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "args": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string" }
+          },
+          "stdin": { "type": "string" },
+          "cwd": { "type": "string", "minLength": 1 },
+          "timeout": { "type": "integer", "minimum": 1, "maximum": 120 }
+        },
+        "required": ["args"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "edit_file",
+      "module": "tools.edit_file",
+      "function": "edit_file",
+      "description": "精确替换工作区内现有 UTF-8 文本文件中的唯一文本。old_text 必须只出现一次。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "old_text": { "type": "string", "minLength": 1 },
+          "new_text": { "type": "string" }
+        },
+        "required": ["path", "old_text", "new_text"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "search_files",
+      "module": "tools.search_files",
+      "function": "search_files",
+      "description": "递归搜索工作区文本文件中的普通字符串。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string", "minLength": 1 },
+          "path": { "type": "string", "minLength": 1 },
+          "pattern": { "type": "string", "minLength": 1 }
+        },
+        "required": ["query"],
+        "additionalProperties": false
+      }
+    }
+  ]
+}
