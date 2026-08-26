@@ -1,11 +1,13 @@
 # AI Coding Agent
 
-一个使用 TypeScript 和 Node.js 构建的本地命令行 Coding Agent。项目通过 OpenAI-compatible Chat Completions API 驱动 ReAct 循环，支持受控的文件操作、代码搜索、命令执行、权限审批和 Windows 沙箱。
+一个使用 TypeScript 和 Node.js 构建的本地命令行 Coding Agent。项目通过 Responses API 驱动 ReAct 循环，支持受控的文件操作、代码搜索、命令执行、权限审批和 Windows 沙箱。
 
 ## 当前能力
 
 - 多步 ReAct：模型可以连续调用工具，并根据 Observation 决定下一步。
-- 多供应商配置：可配置任意兼容 Chat Completions 的模型服务。
+- Responses Items：完整保留消息、推理项和函数调用上下文，函数结果通过 `call_id` 关联。
+- 本地上下文：显式使用 `store: false`，由客户端重放完整 Items，不依赖远端会话持久化。
+- Provider 配置：支持配置实现 Responses API 的模型服务。
 - 工具注册：从 JSON 配置加载工具声明、本地 Handler 和参数 Schema。
 - 参数校验：使用 AJV 在工具执行前严格校验模型参数。
 - 权限审批：支持 `allow / ask / deny` 与单次、会话级授权。
@@ -21,7 +23,7 @@
 
 - Node.js 22.18 或更高版本
 - npm
-- 一个 OpenAI-compatible 模型服务和 API Key
+- 一个支持 Responses API 的模型服务和 API Key
 - 可选：WSL2 与 bubblewrap，用于 Windows 强隔离命令执行
 
 ## 快速开始
@@ -45,20 +47,22 @@ npm start -- <工作区路径>
 在 `config/settings.toml` 中选择当前 Provider：
 
 ```toml
-active_provider = "glm"
+active_provider = "openai"
 
 [agent]
 prompt = "react"
 max_steps = 10
 
-[providers.glm]
+[providers.openai]
 AGENT_API_KEY = ""
-base_url = "https://open.bigmodel.cn/api/paas/v4/"
-model = "glm-4.5-air"
-context_window = 1000000
+base_url = "https://api.openai.com/v1"
+model = "gpt-5"
+context_window = 400000
 ```
 
 `config/settings.toml` 是本地敏感配置，不应提交到版本库。仓库仅提供不含密钥的 `settings.example.toml`。
+
+配置的 Provider、`base_url` 和模型必须支持 `/responses`。项目不会静默回退到旧协议，接口不兼容时会返回明确错误。
 
 ## 内置工具
 
@@ -130,4 +134,8 @@ coding-agent/
 
 ## 开发状态
 
-当前版本已完成核心 ReAct 工具链、权限模型、文件安全和 Windows 沙箱框架。后续将逐步接入 SessionStore、Runtime 消息持久化、CLI 会话恢复和上下文管理。
+当前版本已完成 Responses API ReAct 工具链、权限模型、文件安全和 Windows 沙箱框架。后续将逐步接入 SessionStore、Runtime Item 持久化、CLI 会话恢复和上下文管理。
+
+## 更新记录
+
+- 2026-08-26 | refactor | 将模型通信完整迁移到 Responses API，支持 typed Items、无状态推理重放和函数调用结果关联。

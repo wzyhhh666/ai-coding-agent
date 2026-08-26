@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { loadTools, ToolRegistry } from "../../tools/registry.ts";
+import {
+  loadTools,
+  toResponseTools,
+  ToolRegistry,
+} from "../../tools/registry.ts";
 import { PermissionEngine } from "../../tools/permissions.ts";
 import { configureWorkspace, edit_file, run_command, write_file } from "../../tools/index.ts";
 
@@ -163,6 +167,30 @@ test("run_command 能在临时工作区里执行安全命令", async () => {
   assert.equal(observation.data.backend, "soft");
   assert.equal(observation.data.sandboxed, false);
   assert.match(observation.data.warning, /应用层防护/);
+});
+
+test("toResponseTools 将内部工具声明转换为 Responses 扁平格式", () => {
+  const parameters = {
+    type: "object",
+    properties: { path: { type: "string" } },
+    required: ["path"],
+    additionalProperties: false,
+  };
+
+  assert.deepEqual(toResponseTools([{
+    type: "function",
+    function: {
+      name: "read_file",
+      description: "读取文件",
+      parameters,
+    },
+  }]), [{
+    type: "function",
+    name: "read_file",
+    description: "读取文件",
+    parameters,
+    strict: false,
+  }]);
 });
 
 test("权限拒绝时 ToolRegistry 不执行 Handler", async () => {

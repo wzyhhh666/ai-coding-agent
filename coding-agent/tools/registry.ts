@@ -26,6 +26,26 @@ export type ToolSpec = {
   };
 };
 
+export type ResponseToolSpec = {
+  type: "function";
+  name: string;
+  description?: string;
+  parameters: Record<string, unknown>;
+  strict: false;
+};
+
+export function toResponseTools(specs: ToolSpec[]): ResponseToolSpec[] {
+  return specs.map((spec) => ({
+    type: "function",
+    name: spec.function.name,
+    ...(spec.function.description === undefined
+      ? {}
+      : { description: spec.function.description }),
+    parameters: spec.function.parameters,
+    strict: false,
+  }));
+}
+
 type ValidationDetail = {
   path: string;
   keyword: string;

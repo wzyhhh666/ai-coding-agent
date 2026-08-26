@@ -1,4 +1,4 @@
-active_provider = "glm"
+active_provider = "openai"
 
 [agent]
 prompt = "react"
@@ -18,15 +18,3 @@ AGENT_API_KEY = ""
 base_url = "https://api.openai.com/v1"
 model = "gpt-5"
 context_window = 400000
-
-[providers.deepseek]
-AGENT_API_KEY = ""
-base_url = "https://api.deepseek.com"
-model = "deepseek-chat"
-context_window = 128000
-
-[providers.glm]
-AGENT_API_KEY = ""
-base_url = "https://open.bigmodel.cn/api/paas/v4/"
-model = "glm-4.5-air"
-context_window = 1000000

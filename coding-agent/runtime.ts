@@ -1,33 +1,26 @@
 import type { Runtime } from "./config.ts";
-import type { ToolRegistry } from "./tools/registry.ts";
+import type { ResponseToolSpec, ToolRegistry } from "./tools/registry.ts";
+import { toResponseTools } from "./tools/registry.ts";
 
 export type RuntimeTurn = {
   input: string;
   reply: string;
 };
 
-type ToolCall = {
-  id: string;
-  type?: "function";
-  function: { name: string; arguments: string };
-};
-
-export type AgentMessage = {
-  role: string;
-  content?: string | null;
-  tool_calls?: ToolCall[];
-  tool_call_id?: string;
+export type ResponseInputItem = Record<string, unknown> & {
+  type?: string;
 };
 
 export type CompactionInput = {
   previousSummary?: string;
   throughTurnSequence: number;
-  messages: AgentMessage[];
-  recentMessages: AgentMessage[];
+  items: ResponseInputItem[];
+  recentItems: ResponseInputItem[];
 };
 
-export function compactionMessage(summary: string): AgentMessage {
+export function compactionItem(summary: string): ResponseInputItem {
   return {
+    type: "message",
     role: "system",
     content: `会话历史摘要：\n${summary}`,
   };
@@ -35,7 +28,7 @@ export function compactionMessage(summary: string): AgentMessage {
 
 export type SessionRecorder = {
   startTurn(userInput: string): Promise<string>;
-  appendMessage(turnId: string, message: AgentMessage): Promise<void>;
+  appendItem(turnId: string, item: ResponseInputItem): Promise<void>;
   completeTurn(turnId: string): Promise<void>;
   failTurn(turnId: string, error: unknown): Promise<void>;
   prepareCompaction?(): Promise<CompactionInput | undefined>;
@@ -45,12 +38,47 @@ export type SessionRecorder = {
   ): Promise<void>;
 };
 
-type AssistantMessage = { content: string | null; tool_calls?: ToolCall[] };
+type ResponseStatus =
+  | "queued"
+  | "in_progress"
+  | "completed"
+  | "incomplete"
+  | "failed"
+  | "cancelled";
 
-type ModelUsage = {
-  prompt_tokens?: number;
-  completion_tokens?: number;
-  total_tokens?: number;
+type ResponseError = {
+  code?: string | null;
+  message?: string | null;
+};
+
+type ModelResponse = {
+  id: string;
+  status: ResponseStatus;
+  output: ResponseInputItem[];
+  output_text: string;
+  error?: ResponseError | null;
+  incomplete_details?: Record<string, unknown> | null;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    total_tokens?: number;
+  } | null;
+};
+
+export type ResponsesRequest = {
+  model: string;
+  instructions: string;
+  input: ResponseInputItem[];
+  store: false;
+  include: ["reasoning.encrypted_content"];
+  tools?: ResponseToolSpec[];
+  tool_choice?: "auto";
+};
+
+export type ResponsesClient = {
+  responses: {
+    create(request: ResponsesRequest): Promise<ModelResponse>;
+  };
 };
 
 export type TokenUsage = {
@@ -59,18 +87,11 @@ export type TokenUsage = {
   totalTokens: number;
 };
 
-export type ChatClient = {
-  chat: {
-    completions: {
-      create(request: Record<string, unknown>): Promise<{
-        choices: Array<{
-          message: AssistantMessage;
-          finish_reason?: string | null;
-        }>;
-        usage?: ModelUsage;
-      }>;
-    };
-  };
+type FunctionCall = ResponseInputItem & {
+  type: "function_call";
+  call_id: string;
+  name: string;
+  arguments: string;
 };
 
 export function sanitizeUnicode(value: unknown): unknown {
@@ -84,28 +105,68 @@ export function sanitizeUnicode(value: unknown): unknown {
   return value;
 }
 
-function assistantMessage(message: { content: string | null; tool_calls?: ToolCall[] }): AgentMessage {
-  const result: AgentMessage = { role: "assistant" };
-  if (message.content !== null)   result.content = message.content;
-  if (message.tool_calls?.length) result.tool_calls = message.tool_calls;
-  return result;
+function isFunctionCall(item: ResponseInputItem): item is FunctionCall {
+  return item.type === "function_call" &&
+    typeof item.call_id === "string" &&
+    typeof item.name === "string" &&
+    typeof item.arguments === "string";
 }
 
-function summarizeToolCalls(toolCalls: ToolCall[]): string {
-  return toolCalls
-    .map((call) => `${call.function.name}(${call.function.arguments})`)
-    .join("; ");
+function responseErrorMessage(response: ModelResponse): string {
+  if (response.status === "incomplete") {
+    const details = response.incomplete_details === null ||
+        response.incomplete_details === undefined
+      ? "无详细信息"
+      : JSON.stringify(response.incomplete_details);
+    return `模型响应不完整: ${details}`;
+  }
+
+  if (response.status === "failed") {
+    const code = response.error?.code ? ` (${response.error.code})` : "";
+    return `模型响应失败${code}: ${response.error?.message ?? "无详细信息"}`;
+  }
+
+  if (response.status === "cancelled") return "模型响应已取消";
+  return `同步模型请求返回了非终态: ${response.status}`;
+}
+
+function refusalText(items: ResponseInputItem[]): string | undefined {
+  for (const item of items) {
+    if (item.type !== "message" || !Array.isArray(item.content)) continue;
+    for (const content of item.content) {
+      if (
+        content !== null &&
+        typeof content === "object" &&
+        "type" in content &&
+        content.type === "refusal" &&
+        "refusal" in content &&
+        typeof content.refusal === "string"
+      ) {
+        return content.refusal;
+      }
+    }
+  }
+  return undefined;
+}
+
+function requestFailure(error: unknown): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  return new Error(
+    `Responses API 请求失败: ${message}。请确认当前 Provider、base_url 和模型支持 /responses。`,
+    { cause: error },
+  );
 }
 
 export class ReActRuntime {
   private readonly runtime: Runtime;
-  private readonly client: ChatClient;
+  private readonly client: ResponsesClient;
   private readonly model: string;
+  private readonly systemPrompt: string;
   private readonly tools: ToolRegistry;
-  private readonly messages: AgentMessage[];
+  private readonly inputItems: ResponseInputItem[] = [];
 
   constructor(
-    client: ChatClient,
+    client: ResponsesClient,
     model: string,
     systemPrompt: string,
     runtime: Runtime,
@@ -113,67 +174,97 @@ export class ReActRuntime {
   ) {
     this.client = client;
     this.model = model;
+    this.systemPrompt = systemPrompt;
     this.runtime = runtime;
     this.tools = tools;
-    this.messages = [{ role: "system", content: systemPrompt }];
   }
 
-  async runTurn(userInput: string, output: (line: string) => void = console.log): Promise<RuntimeTurn> {
-    const trimmedInput = userInput.trim();
-    if (trimmedInput.length === 0) {
+  async runTurn(
+    userInput: string,
+    output: (line: string) => void = console.log,
+  ): Promise<RuntimeTurn> {
+    if (userInput.trim().length === 0) {
       return {
         input: userInput,
         reply: "请输入要处理的内容。",
       };
     }
 
-    const userMessage: AgentMessage = { role: "user", content: userInput };
+    const turnStartIndex = this.inputItems.length;
     this.tools.beginTurn();
-    this.messages.push(userMessage);
+    this.inputItems.push({ role: "user", content: userInput });
 
     try {
       for (let step = 0; step < this.runtime.maxSteps; step += 1) {
         const stepLabel = `[Step ${step + 1}/${this.runtime.maxSteps}]`;
         output(`${stepLabel} → 请求模型`);
-        const request: Record<string, unknown> = {
-          model: this.model,
-          messages: this.messages,
-        };
-        if (this.tools.specs.length > 0) {
-          request.tools = this.tools.specs;
-          request.tool_choice = "auto";
-        }
-        const response = await this.client.chat.completions.create(
-          sanitizeUnicode(request) as Record<string, unknown>,
-        );
-        const choice = response.choices[0];
-        const message = choice?.message;
-        if (!message) throw new Error("模型响应为空");
-        this.messages.push(assistantMessage(message));
 
-        if (!message.tool_calls?.length) {
-          output(`${stepLabel} ← ${message.content ? "最终回答" : "空响应"}`);
-          return { input: userInput, reply: message.content ?? "" };
-        }
-
-        output(`${stepLabel} ← 工具调用，共 ${message.tool_calls.length} 个`);
-        for (const [index, call] of message.tool_calls.entries()) {
-          output(`  [Tool ${index + 1}/${message.tool_calls.length}] ${call.function.name}`);
-          const observation = await this.tools.execute(
-            call.function.name,
-            call.function.arguments,
+        const request = this.createRequest();
+        let response: ModelResponse;
+        try {
+          response = await this.client.responses.create(
+            sanitizeUnicode(request) as ResponsesRequest,
           );
-          output(`  [Tool ${index + 1}/${message.tool_calls.length}] Observation: ${observation}`);
-          this.messages.push({
-            role: "tool",
-            tool_call_id: call.id,
-            content: observation,
+        } catch (error) {
+          throw requestFailure(error);
+        }
+
+        if (response.status !== "completed") {
+          throw new Error(responseErrorMessage(response));
+        }
+        if (!Array.isArray(response.output) || response.output.length === 0) {
+          throw new Error("模型响应为空");
+        }
+
+        // 完整重放输出，确保推理项和函数调用上下文不会丢失。
+        this.inputItems.push(...response.output);
+        const functionCalls = response.output.filter(isFunctionCall);
+
+        if (functionCalls.length === 0) {
+          const refusal = refusalText(response.output);
+          if (refusal !== undefined) throw new Error(`模型拒绝请求: ${refusal}`);
+          if (response.output_text.length === 0) throw new Error("模型响应没有文本输出");
+          output(`${stepLabel} ← 最终回答`);
+          return { input: userInput, reply: response.output_text };
+        }
+
+        output(`${stepLabel} ← 工具调用，共 ${functionCalls.length} 个`);
+        for (const [index, call] of functionCalls.entries()) {
+          output(`  [Tool ${index + 1}/${functionCalls.length}] ${call.name}`);
+          const observation = await this.tools.execute(call.name, call.arguments);
+          output(
+            `  [Tool ${index + 1}/${functionCalls.length}] Observation: ${observation}`,
+          );
+          this.inputItems.push({
+            type: "function_call_output",
+            call_id: call.call_id,
+            output: observation,
           });
         }
       }
       throw new Error(`已达到最大步骤数 ${this.runtime.maxSteps}`);
+    } catch (error) {
+      // 失败 Turn 不进入下一轮上下文，保持内存历史与后续持久化语义一致。
+      this.inputItems.length = turnStartIndex;
+      throw error;
     } finally {
       this.tools.finishTurn();
     }
+  }
+
+  private createRequest(): ResponsesRequest {
+    const request: ResponsesRequest = {
+      model: this.model,
+      instructions: this.systemPrompt,
+      input: this.inputItems,
+      store: false,
+      include: ["reasoning.encrypted_content"],
+    };
+
+    if (this.tools.specs.length > 0) {
+      request.tools = toResponseTools(this.tools.specs);
+      request.tool_choice = "auto";
+    }
+    return request;
   }
 }

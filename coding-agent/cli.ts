@@ -4,7 +4,7 @@ import { createInterface } from "node:readline/promises";
 import OpenAI from "openai";
 
 import { loadRuntime } from "./config.ts";
-import { ReActRuntime, type ChatClient } from "./runtime.ts";
+import { ReActRuntime, type ResponsesClient } from "./runtime.ts";
 import { configureSandbox, configureWorkspace } from "./tools/index.ts";
 import { loadTools } from "./tools/registry.ts";
 
@@ -52,7 +52,7 @@ export async function runCli(): Promise<void> {
   const client = new OpenAI({
     apiKey: runtimeConfig.provider.AGENT_API_KEY,
     baseURL: runtimeConfig.provider.base_url,
-  }) as unknown as ChatClient;
+  }) as unknown as ResponsesClient;
   const terminal = createInterface({ input: stdin, output: stdout });
   const agent = new ReActRuntime(
     client,
