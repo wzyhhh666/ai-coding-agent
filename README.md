@@ -138,4 +138,17 @@ coding-agent/
 
 ## 更新记录
 
-- 2026-08-26 | refactor | 将模型通信完整迁移到 Responses API，支持 typed Items、无状态推理重放和函数调用结果关联。
+### 2026-08-26
+
+- 将 Runtime 的模型请求端点从 Chat Completions API 替换为 Responses API，并移除运行时代码中对 `choices`、Chat Message 和 `role: "tool"` 的协议依赖。
+- 将本地上下文从消息数组改为 Responses Item 数组；每次请求显式发送 `instructions`，并设置 `store: false`，由客户端维护和重放上下文。
+- 完整保存并重放每次响应的 `output` Items，包括 reasoning Item、message Item 和 function call Item，避免工具循环中丢失推理上下文。
+- 将工具调用改为 Responses API 的 `function_call` 格式，并使用 `function_call_output` 通过 `call_id` 关联工具执行结果。
+- 支持同一响应中的多个工具调用，同时保持现有工具按返回顺序串行执行，避免权限审批、文件修改和变更跟踪产生竞态。
+- 新增工具声明转换，将内部工具配置转换为 Responses API 扁平函数格式，并显式设置 `strict: false` 兼容当前 JSON Schema。
+- 保留现有 AJV 参数校验、`allow / ask / deny` 权限审批、工作区路径保护、Windows 沙箱、文件变更跟踪和最大 ReAct 步骤限制。
+- 增加 Responses 响应状态处理，区分 `incomplete`、`failed`、`cancelled`、非终态响应、空输出、模型拒绝和 API 请求异常，并返回明确错误。
+- 增加失败 Turn 上下文回滚，防止请求异常或响应不完整时将半截 Item 历史带入后续 Turn。
+- 更新示例 Provider 配置和 README 使用说明，明确 Provider、`base_url` 和模型必须支持 `/responses`，不再静默回退到旧协议。
+- 补充普通回复、多工具调用、reasoning 重放、工具格式转换、状态错误、请求失败、空输出、模型拒绝、步骤上限和失败上下文回滚测试。
+- 验证结果：`npm run typecheck` 通过；`npm test` 共 43 项测试，42 项通过，1 项真实 WSL2 沙箱测试因环境条件跳过。
