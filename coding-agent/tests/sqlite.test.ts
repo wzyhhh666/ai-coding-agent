@@ -59,20 +59,21 @@ test("状态数据库初始化 Schema、PRAGMA 和文件权限", async () => {
     for (const name of [
       "sessions",
       "turns",
-      "messages",
+      "items",
       "compactions",
       "sessions_workspace_updated_idx",
       "turns_session_sequence_idx",
-      "messages_session_sequence_idx",
+      "items_session_sequence_idx",
     ]) {
       assert.equal(schemaNames.has(name), true, `缺少数据库对象: ${name}`);
     }
 
     database.prepare(`
       INSERT INTO sessions
-        (id, workspace_path, title, created_at, updated_at, last_model, system_prompt_hash)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run("session-1", "/workspace", null, 1, 1, "model-x", "hash");
+        (id, workspace_path, workspace_key, title, created_at, updated_at,
+         last_model, system_prompt_hash)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("session-1", "/workspace", "/workspace", null, 1, 1, "model-x", "hash");
     database.prepare(`
       INSERT INTO compactions
         (session_id, summary, through_turn_sequence, updated_at)
@@ -104,14 +105,14 @@ test("状态数据库初始化 Schema、PRAGMA 和文件权限", async () => {
       VALUES (?, ?, ?, ?, ?, ?)
     `).run("turn-1", "session-1", 1, "hello", "running", 1);
     database.prepare(`
-      INSERT INTO messages
-        (session_id, turn_id, sequence, role, payload_json, created_at)
+      INSERT INTO items
+        (session_id, turn_id, sequence, item_type, payload_json, created_at)
       VALUES (?, ?, ?, ?, ?, ?)
-    `).run("session-1", "turn-1", 1, "user", '{"role":"user","content":"hello"}', 1);
+    `).run("session-1", "turn-1", 1, "message", '{"role":"user","content":"hello"}', 1);
 
     database.prepare("DELETE FROM sessions WHERE id = ?").run("session-1");
     assert.equal(record(database.prepare("SELECT COUNT(*) AS count FROM turns").get()).count, 0);
-    assert.equal(record(database.prepare("SELECT COUNT(*) AS count FROM messages").get()).count, 0);
+    assert.equal(record(database.prepare("SELECT COUNT(*) AS count FROM items").get()).count, 0);
     assert.equal(
       record(database.prepare("SELECT COUNT(*) AS count FROM compactions").get()).count,
       0,
@@ -148,6 +149,26 @@ test("拒绝打开比当前程序更新的数据库", async () => {
   await assert.rejects(
     () => initializeStateDatabase(databasePath),
     /高于当前程序支持的版本/,
+  );
+  await removeSqliteTestFiles(databasePath, [root]);
+});
+
+test("拒绝打开版本号相同但结构不兼容的开发数据库", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "coding-agent-sqlite-test-"));
+  const databasePath = path.join(root, "state.sqlite");
+  const database = new DatabaseSync(databasePath);
+  database.exec(`
+    CREATE TABLE sessions (
+      id TEXT PRIMARY KEY,
+      workspace_path TEXT NOT NULL
+    );
+    PRAGMA user_version = ${CURRENT_SCHEMA_VERSION};
+  `);
+  database.close();
+
+  await assert.rejects(
+    () => initializeStateDatabase(databasePath),
+    /Schema 与当前版本 1 不一致/,
   );
   await removeSqliteTestFiles(databasePath, [root]);
 });

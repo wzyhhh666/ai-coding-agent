@@ -22,6 +22,7 @@ const MIGRATIONS: Migration[] = [
       CREATE TABLE sessions (
         id TEXT PRIMARY KEY,
         workspace_path TEXT NOT NULL,
+        workspace_key TEXT NOT NULL,
         title TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
@@ -30,7 +31,7 @@ const MIGRATIONS: Migration[] = [
       );
 
       CREATE INDEX sessions_workspace_updated_idx
-      ON sessions(workspace_path, updated_at DESC);
+      ON sessions(workspace_key, updated_at DESC);
 
       CREATE TABLE turns (
         id TEXT PRIMARY KEY,
@@ -51,12 +52,12 @@ const MIGRATIONS: Migration[] = [
       CREATE INDEX turns_session_sequence_idx
       ON turns(session_id, sequence);
 
-      CREATE TABLE messages (
+      CREATE TABLE items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL,
         turn_id TEXT NOT NULL,
         sequence INTEGER NOT NULL,
-        role TEXT NOT NULL,
+        item_type TEXT NOT NULL,
         payload_json TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         FOREIGN KEY (session_id)
@@ -68,8 +69,8 @@ const MIGRATIONS: Migration[] = [
         UNIQUE (session_id, sequence)
       );
 
-      CREATE INDEX messages_session_sequence_idx
-      ON messages(session_id, sequence);
+      CREATE INDEX items_session_sequence_idx
+      ON items(session_id, sequence);
 
       CREATE TABLE compactions (
         session_id TEXT PRIMARY KEY,
@@ -154,6 +155,25 @@ function migrateDatabase(database: DatabaseSync): void {
   }
 }
 
+function tableColumns(database: DatabaseSync, table: string): Set<string> {
+  return new Set(
+    database.prepare(`PRAGMA table_info(${table})`).all().map((value) => {
+      const row = value as Record<string, unknown>;
+      return String(row.name);
+    }),
+  );
+}
+
+function validateCurrentSchema(database: DatabaseSync): void {
+  const sessionColumns = tableColumns(database, "sessions");
+  const itemColumns = tableColumns(database, "items");
+  if (!sessionColumns.has("workspace_key") || !itemColumns.has("item_type")) {
+    throw new Error(
+      "数据库 Schema 与当前版本 1 不一致；请先备份并重建本地开发数据库",
+    );
+  }
+}
+
 export async function initializeStateDatabase(
   databasePath = stateDatabasePath(),
 ): Promise<DatabaseSync> {
@@ -164,6 +184,7 @@ export async function initializeStateDatabase(
     database = new DatabaseSync(databasePath);
     configureDatabase(database);
     migrateDatabase(database);
+    validateCurrentSchema(database);
     return database;
   } catch (error) {
     database?.close();

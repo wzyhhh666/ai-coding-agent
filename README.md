@@ -15,9 +15,9 @@
 - 精确编辑：支持原子写入、唯一文本替换和 unified diff。
 - 命令执行：使用结构化 argv、`shell: false`、超时和输出截断。
 - Windows 沙箱：优先使用 WSL2 + bubblewrap，支持 strict 和显式 soft fallback。
-- SQLite 基础层：包含 Schema 迁移、外键、WAL 和会话数据表结构。
+- SQLite 会话层：包含 Schema 迁移、外键、WAL、Session/Turn/Item 事务写入和完整 Turn 恢复。
 
-> SQLite Session 持久化目前仍处于基础设施阶段，尚未接入 CLI 会话恢复流程。
+> SessionStore 已可独立保存和恢复会话数据，但尚未接入 Runtime 和 CLI 会话恢复流程。
 
 ## 环境要求
 
@@ -126,6 +126,7 @@ coding-agent/
 ├── config.ts                 # TOML 配置加载和校验
 ├── runtime.ts                # ReAct 模型循环
 ├── sqlite.ts                 # SQLite Schema 与迁移
+├── session/                  # SessionStore、Turn 与 Item 持久化
 ├── file_change_tracker.ts    # 文件变更和 diff
 ├── config/                   # Prompt、工具和本地配置
 ├── tools/                    # 工具、权限、注册表与沙箱
@@ -134,9 +135,20 @@ coding-agent/
 
 ## 开发状态
 
-当前版本已完成 Responses API ReAct 工具链、权限模型、文件安全和 Windows 沙箱框架。后续将逐步接入 SessionStore、Runtime Item 持久化、CLI 会话恢复和上下文管理。
+当前版本已完成 Responses API ReAct 工具链、权限模型、文件安全、Windows 沙箱框架和独立 SessionStore。后续将把 SessionRecorder 接入 Runtime，再实现 CLI 会话恢复和上下文管理。
 
 ## 更新记录
+
+### 2026-08-27
+
+- feat | 新增独立 SessionStore，支持创建 Session、按工作区查找最近 Session，并通过注入时钟和 ID 生成器保持逻辑可测试。
+- 使用事务创建 Turn 并自动保存 user Item，支持追加完整 Responses Items，以及将 Turn 完成或失败状态原子写入数据库。
+- 恢复会话时只返回 `completed` Turn；上次进程遗留的 `running` Turn 会转换为 `interrupted`，失败和中断 Turn 不进入模型上下文。
+- 增加工作区隔离校验，拒绝从其他工作区恢复 Session、写入 Turn 或创建 SessionRecorder，Windows 路径通过规范化 key 处理大小写差异。
+- 将初始 Schema v1 的 `messages` 表修正为 Responses 语义的 `items` 表，保存 `item_type` 和完整 `payload_json`；保留版本号、事务和未来迁移框架，不增加无业务意义的历史版本。
+- 增加 SessionRecorder 适配器，为后续 Runtime 接入提供 `startTurn / appendItem / completeTurn / failTurn` 接口，本次不修改 Runtime 和 CLI 行为。
+- 补充最近 Session 查询、Item 顺序、成功/失败/中断恢复、工作区隔离、结束后写入拒绝、序列化失败和唯一约束事务回滚测试。
+- 验证结果：`npm run typecheck` 通过；`npm test` 共 51 项测试，50 项通过，1 项真实 WSL2 沙箱测试因环境条件跳过。
 
 ### 2026-08-26
 
