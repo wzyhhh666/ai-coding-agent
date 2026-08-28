@@ -15,9 +15,9 @@
 - 精确编辑：支持原子写入、唯一文本替换和 unified diff。
 - 命令执行：使用结构化 argv、`shell: false`、超时和输出截断。
 - Windows 沙箱：优先使用 WSL2 + bubblewrap，支持 strict 和显式 soft fallback。
-- SQLite 会话层：包含 Schema 迁移、外键、WAL、Session/Turn/Item 事务写入和完整 Turn 恢复。
+- SQLite 会话层：包含 Schema 迁移、外键、WAL、Session/Turn/Item 事务写入、Runtime 生命周期记录和完整 Turn 恢复。
 
-> SessionStore 已可独立保存和恢复会话数据，但尚未接入 Runtime 和 CLI 会话恢复流程。
+> Runtime 已支持注入 SessionRecorder 和已恢复的 Responses Items；CLI 尚未自动创建、选择或恢复 Session。
 
 ## 环境要求
 
@@ -135,9 +135,21 @@ coding-agent/
 
 ## 开发状态
 
-当前版本已完成 Responses API ReAct 工具链、权限模型、文件安全、Windows 沙箱框架和独立 SessionStore。后续将把 SessionRecorder 接入 Runtime，再实现 CLI 会话恢复和上下文管理。
+当前版本已完成 Responses API ReAct 工具链、权限模型、文件安全、Windows 沙箱框架，以及 Runtime 与 SessionStore 之间的可选记录接口。后续将实现 CLI 会话创建与恢复，再继续完善上下文管理。
 
 ## 更新记录
+
+### 2026-08-28
+
+- feat | 为 ReActRuntime 增加可选 options 对象，在不改变现有调用方式的前提下支持注入 SessionRecorder 和已恢复的 Responses Items，Runtime 不直接依赖 SQLite 实现。
+- 每个非空请求在模型执行前创建 Turn；模型返回的 reasoning、message、function_call 等完整 output Items，以及本地生成的 function_call_output，均按协议原始顺序写入记录器。
+- 仅在模型返回有效最终文本且输出流程成功后完成 Turn；API 异常、响应状态异常、拒绝、空输出、工具循环达到步骤上限或持久化失败都会将 Turn 标记为 failed。
+- 失败回合会回滚本轮内存 Items，避免半完成上下文进入下一轮；失败状态写入本身异常时保留原始运行错误，并尽力附加持久化诊断，不掩盖首要故障。
+- 初始恢复 Items 通过防御性深拷贝进入 Runtime，模型请求使用数组快照，避免调用方后续修改恢复数据或 Runtime 继续追加上下文时改变已发出的请求。
+- Session 层新增 restoredItems 辅助函数，按 completed Turn 的既有顺序展开 Items，为下一阶段 CLI 恢复装配提供单一转换入口。
+- 本阶段保持 CLI 行为不变，尚未自动创建、选择或恢复 Session，避免在 Runtime 生命周期闭环验证前扩大改动范围。
+- 补充成功回合、工具调用顺序、API 失败、步骤上限、Item 写入失败、失败补偿异常、恢复上下文隔离和空输入测试。
+- 验证结果：`npm run typecheck` 通过；`npm test` 共 59 项测试，58 项通过，1 项真实 WSL2 沙箱测试因环境条件跳过。
 
 ### 2026-08-27
 

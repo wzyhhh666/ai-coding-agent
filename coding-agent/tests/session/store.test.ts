@@ -5,7 +5,7 @@ import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
-import { SessionStore } from "../../session/store.ts";
+import { restoredItems, SessionStore } from "../../session/store.ts";
 import { initializeStateDatabase } from "../../sqlite.ts";
 
 type TestContext = {
@@ -272,4 +272,33 @@ test("SessionRecorder 适配器代理 SessionStore 生命周期操作", async ()
   } finally {
     await closeTestContext(context);
   }
+});
+
+test("restoredItems 按已恢复 Turn 顺序展开 Responses Items", () => {
+  const first = { role: "user", content: "first" };
+  const second = { role: "assistant", content: "second" };
+  const items = restoredItems({
+    session: {
+      id: "session-1",
+      workspacePath: "workspace",
+      title: null,
+      createdAt: 1,
+      updatedAt: 2,
+      lastModel: null,
+      systemPromptHash: null,
+    },
+    turns: [{
+      id: "turn-1",
+      sessionId: "session-1",
+      sequence: 1,
+      userInput: "first",
+      status: "completed",
+      startedAt: 1,
+      completedAt: 2,
+      error: null,
+      items: [first, second],
+    }],
+  });
+
+  assert.deepEqual(items, [first, second]);
 });

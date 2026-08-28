@@ -39,6 +39,10 @@ export type RestoredSession = {
   turns: RestoredTurn[];
 };
 
+export function restoredItems(session: RestoredSession): ResponseInputItem[] {
+  return session.turns.flatMap((turn) => turn.items);
+}
+
 export type CreateSessionInput = {
   title?: string;
   model?: string;

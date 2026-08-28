@@ -6,6 +6,7 @@ import {
   ReActRuntime,
   type ResponsesClient,
   type ResponsesRequest,
+  type SessionRecorder,
 } from "../runtime.ts";
 import { ToolRegistry } from "../tools/registry.ts";
 
@@ -45,6 +46,29 @@ function message(text: string): Record<string, unknown> {
 
 function emptyTools(): ToolRegistry {
   return new ToolRegistry([], {});
+}
+
+type RecorderEvent = {
+  operation: "start" | "append" | "complete" | "fail";
+  value?: unknown;
+};
+
+function recordingSession(events: RecorderEvent[]): SessionRecorder {
+  return {
+    async startTurn(userInput) {
+      events.push({ operation: "start", value: userInput });
+      return "turn-1";
+    },
+    async appendItem(_turnId, item) {
+      events.push({ operation: "append", value: item });
+    },
+    async completeTurn(turnId) {
+      events.push({ operation: "complete", value: turnId });
+    },
+    async failTurn(_turnId, error) {
+      events.push({ operation: "fail", value: error });
+    },
+  };
 }
 
 test("ReActRuntime 使用 Responses Items 执行多个工具并完整重放上下文", async () => {
@@ -311,6 +335,7 @@ test("ReActRuntime 区分请求失败、空输出和模型拒绝", async (contex
 });
 
 test("ReActRuntime 达到步骤上限时仍结束工具回合", async () => {
+  const recorderEvents: RecorderEvent[] = [];
   const client: ResponsesClient = {
     responses: {
       async create() {
@@ -350,6 +375,7 @@ test("ReActRuntime 达到步骤上限时仍结束工具回合", async () => {
     "test prompt",
     { ...runtimeConfig, maxSteps: 1 },
     tools,
+    { recorder: recordingSession(recorderEvents) },
   );
 
   await assert.rejects(
@@ -357,6 +383,10 @@ test("ReActRuntime 达到步骤上限时仍结束工具回合", async () => {
     /已达到最大步骤数 1/,
   );
   assert.equal(finished, true);
+  assert.deepEqual(
+    recorderEvents.map((event) => event.operation),
+    ["start", "append", "append", "fail"],
+  );
 });
 
 test("ReActRuntime 失败 Turn 不会污染下一轮上下文", async () => {
@@ -383,4 +413,216 @@ test("ReActRuntime 失败 Turn 不会污染下一轮上下文", async () => {
 
   assert.equal(result.reply, "recovered");
   assert.deepEqual(requests[1]?.input, [{ role: "user", content: "next turn" }]);
+});
+
+test("ReActRuntime 成功回合按生命周期持久化完整输出", async () => {
+  const events: RecorderEvent[] = [];
+  const assistantMessage = message("done");
+  const client: ResponsesClient = {
+    responses: { async create() {
+      return response([assistantMessage], "done");
+    } },
+  };
+  const runtime = new ReActRuntime(
+    client,
+    "test-model",
+    "test prompt",
+    runtimeConfig,
+    emptyTools(),
+    { recorder: recordingSession(events) },
+  );
+
+  await runtime.runTurn("work", () => undefined);
+
+  assert.deepEqual(events, [
+    { operation: "start", value: "work" },
+    { operation: "append", value: assistantMessage },
+    { operation: "complete", value: "turn-1" },
+  ]);
+});
+
+test("ReActRuntime 按协议顺序持久化模型输出和工具结果", async () => {
+  const events: RecorderEvent[] = [];
+  let requestCount = 0;
+  const reasoning = { type: "reasoning", encrypted_content: "secret" };
+  const functionCall = {
+    type: "function_call",
+    call_id: "call-1",
+    name: "echo",
+    arguments: '{"text":"hello"}',
+  };
+  const finalMessage = message("done");
+  const client: ResponsesClient = {
+    responses: { async create() {
+      requestCount += 1;
+      return requestCount === 1
+        ? response([reasoning, functionCall])
+        : response([finalMessage], "done");
+    } },
+  };
+  const tools = new ToolRegistry(
+    [{
+      type: "function",
+      function: {
+        name: "echo",
+        parameters: { type: "object", properties: {}, additionalProperties: true },
+      },
+    }],
+    { echo: ({ text }) => String(text) },
+  );
+  const runtime = new ReActRuntime(
+    client,
+    "test-model",
+    "test prompt",
+    runtimeConfig,
+    tools,
+    { recorder: recordingSession(events) },
+  );
+
+  await runtime.runTurn("work", () => undefined);
+
+  assert.deepEqual(events, [
+    { operation: "start", value: "work" },
+    { operation: "append", value: reasoning },
+    { operation: "append", value: functionCall },
+    {
+      operation: "append",
+      value: { type: "function_call_output", call_id: "call-1", output: "hello" },
+    },
+    { operation: "append", value: finalMessage },
+    { operation: "complete", value: "turn-1" },
+  ]);
+});
+
+test("ReActRuntime 失败时标记 Turn 且不调用完成", async () => {
+  const events: RecorderEvent[] = [];
+  const modelError = new Error("model unavailable");
+  const client: ResponsesClient = {
+    responses: { async create() {
+      throw modelError;
+    } },
+  };
+  const runtime = new ReActRuntime(
+    client,
+    "test-model",
+    "test prompt",
+    runtimeConfig,
+    emptyTools(),
+    { recorder: recordingSession(events) },
+  );
+
+  await assert.rejects(runtime.runTurn("work", () => undefined));
+
+  assert.deepEqual(events.map((event) => event.operation), ["start", "fail"]);
+  assert.match(String(events[1]?.value), /Responses API 请求失败/);
+});
+
+test("ReActRuntime 持久化 Item 失败时回滚上下文并标记失败", async () => {
+  const requests: ResponsesRequest[] = [];
+  const events: RecorderEvent[] = [];
+  let appendCount = 0;
+  const recorder = recordingSession(events);
+  recorder.appendItem = async () => {
+    appendCount += 1;
+    throw new Error("database unavailable");
+  };
+  const client: ResponsesClient = {
+    responses: { async create(request) {
+      requests.push(request);
+      return response([message("done")], "done");
+    } },
+  };
+  const runtime = new ReActRuntime(
+    client,
+    "test-model",
+    "test prompt",
+    runtimeConfig,
+    emptyTools(),
+    { recorder },
+  );
+
+  await assert.rejects(
+    runtime.runTurn("first", () => undefined),
+    /database unavailable/,
+  );
+  await assert.rejects(runtime.runTurn("second", () => undefined));
+
+  assert.equal(appendCount, 2);
+  assert.deepEqual(requests[1]?.input, [{ role: "user", content: "second" }]);
+  assert.equal(events.filter((event) => event.operation === "fail").length, 2);
+});
+
+test("ReActRuntime 不用失败记录错误覆盖原始运行错误", async () => {
+  const originalError = new Error("primary failure");
+  const recorder = recordingSession([]);
+  recorder.failTurn = async () => {
+    throw new Error("persistence failure");
+  };
+  const client: ResponsesClient = {
+    responses: { async create() {
+      throw originalError;
+    } },
+  };
+  const runtime = new ReActRuntime(
+    client,
+    "test-model",
+    "test prompt",
+    runtimeConfig,
+    emptyTools(),
+    { recorder },
+  );
+
+  await assert.rejects(runtime.runTurn("work", () => undefined), (error) => {
+    assert.match(String(error), /Responses API 请求失败: primary failure/);
+    assert.match(String((error as Error & { persistenceError: unknown }).persistenceError), /persistence failure/);
+    return true;
+  });
+});
+
+test("ReActRuntime 从防御性副本恢复上下文", async () => {
+  const requests: ResponsesRequest[] = [];
+  const restored = [{ role: "user", content: { text: "old" } }];
+  const client: ResponsesClient = {
+    responses: { async create(request) {
+      requests.push(request);
+      return response([message("done")], "done");
+    } },
+  };
+  const runtime = new ReActRuntime(
+    client,
+    "test-model",
+    "test prompt",
+    runtimeConfig,
+    emptyTools(),
+    { initialItems: restored },
+  );
+  (restored[0]!.content as { text: string }).text = "changed";
+
+  await runtime.runTurn("new", () => undefined);
+
+  assert.deepEqual(requests[0]?.input.slice(0, 2), [
+    { role: "user", content: { text: "old" } },
+    { role: "user", content: "new" },
+  ]);
+});
+
+test("ReActRuntime 空输入不创建持久化 Turn", async () => {
+  const events: RecorderEvent[] = [];
+  const client: ResponsesClient = {
+    responses: { async create() {
+      return response([message("unexpected")], "unexpected");
+    } },
+  };
+  const runtime = new ReActRuntime(
+    client,
+    "test-model",
+    "test prompt",
+    runtimeConfig,
+    emptyTools(),
+    { recorder: recordingSession(events) },
+  );
+
+  await runtime.runTurn("  ", () => undefined);
+
+  assert.deepEqual(events, []);
 });

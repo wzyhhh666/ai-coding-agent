@@ -38,6 +38,11 @@ export type SessionRecorder = {
   ): Promise<void>;
 };
 
+export type ReActRuntimeOptions = {
+  recorder?: SessionRecorder;
+  initialItems?: ResponseInputItem[];
+};
+
 type ResponseStatus =
   | "queued"
   | "in_progress"
@@ -163,7 +168,8 @@ export class ReActRuntime {
   private readonly model: string;
   private readonly systemPrompt: string;
   private readonly tools: ToolRegistry;
-  private readonly inputItems: ResponseInputItem[] = [];
+  private readonly recorder?: SessionRecorder;
+  private readonly inputItems: ResponseInputItem[];
 
   constructor(
     client: ResponsesClient,
@@ -171,12 +177,15 @@ export class ReActRuntime {
     systemPrompt: string,
     runtime: Runtime,
     tools: ToolRegistry,
+    options: ReActRuntimeOptions = {},
   ) {
     this.client = client;
     this.model = model;
     this.systemPrompt = systemPrompt;
     this.runtime = runtime;
     this.tools = tools;
+    this.recorder = options.recorder;
+    this.inputItems = structuredClone(options.initialItems ?? []);
   }
 
   async runTurn(
@@ -191,10 +200,13 @@ export class ReActRuntime {
     }
 
     const turnStartIndex = this.inputItems.length;
+    let turnId: string | undefined;
     this.tools.beginTurn();
-    this.inputItems.push({ role: "user", content: userInput });
 
     try {
+      turnId = await this.recorder?.startTurn(userInput);
+      this.inputItems.push({ role: "user", content: userInput });
+
       for (let step = 0; step < this.runtime.maxSteps; step += 1) {
         const stepLabel = `[Step ${step + 1}/${this.runtime.maxSteps}]`;
         output(`${stepLabel} → 请求模型`);
@@ -217,7 +229,7 @@ export class ReActRuntime {
         }
 
         // 完整重放输出，确保推理项和函数调用上下文不会丢失。
-        this.inputItems.push(...response.output);
+        await this.appendItems(turnId, response.output);
         const functionCalls = response.output.filter(isFunctionCall);
 
         if (functionCalls.length === 0) {
@@ -225,6 +237,7 @@ export class ReActRuntime {
           if (refusal !== undefined) throw new Error(`模型拒绝请求: ${refusal}`);
           if (response.output_text.length === 0) throw new Error("模型响应没有文本输出");
           output(`${stepLabel} ← 最终回答`);
+          if (turnId !== undefined) await this.recorder?.completeTurn(turnId);
           return { input: userInput, reply: response.output_text };
         }
 
@@ -235,17 +248,18 @@ export class ReActRuntime {
           output(
             `  [Tool ${index + 1}/${functionCalls.length}] Observation: ${observation}`,
           );
-          this.inputItems.push({
+          await this.appendItems(turnId, [{
             type: "function_call_output",
             call_id: call.call_id,
             output: observation,
-          });
+          }]);
         }
       }
       throw new Error(`已达到最大步骤数 ${this.runtime.maxSteps}`);
     } catch (error) {
       // 失败 Turn 不进入下一轮上下文，保持内存历史与后续持久化语义一致。
       this.inputItems.length = turnStartIndex;
+      if (turnId !== undefined) await this.recordTurnFailure(turnId, error);
       throw error;
     } finally {
       this.tools.finishTurn();
@@ -256,7 +270,7 @@ export class ReActRuntime {
     const request: ResponsesRequest = {
       model: this.model,
       instructions: this.systemPrompt,
-      input: this.inputItems,
+      input: [...this.inputItems],
       store: false,
       include: ["reasoning.encrypted_content"],
     };
@@ -266,5 +280,32 @@ export class ReActRuntime {
       request.tool_choice = "auto";
     }
     return request;
+  }
+
+  private async appendItems(
+    turnId: string | undefined,
+    items: ResponseInputItem[],
+  ): Promise<void> {
+    for (const item of items) {
+      if (turnId !== undefined) await this.recorder?.appendItem(turnId, item);
+      this.inputItems.push(item);
+    }
+  }
+
+  private async recordTurnFailure(turnId: string, error: unknown): Promise<void> {
+    try {
+      await this.recorder?.failTurn(turnId, error);
+    } catch (persistenceError) {
+      if (error !== null && (typeof error === "object" || typeof error === "function")) {
+        try {
+          Object.defineProperty(error, "persistenceError", {
+            value: persistenceError,
+            configurable: true,
+          });
+        } catch {
+          // 原始运行错误始终优先，附加诊断失败时不再产生次生错误。
+        }
+      }
+    }
   }
 }
