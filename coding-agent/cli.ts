@@ -5,6 +5,12 @@ import OpenAI from "openai";
 
 import { loadRuntime } from "./config.ts";
 import { ReActRuntime, type ResponsesClient } from "./runtime.ts";
+import { prepareRuntimeSession } from "./session/bootstrap.ts";
+import { SessionStore } from "./session/store.ts";
+import {
+  initializeStateDatabase,
+  STATE_PRIVACY_NOTICE,
+} from "./sqlite.ts";
 import { configureSandbox, configureWorkspace } from "./tools/index.ts";
 import { loadTools } from "./tools/registry.ts";
 
@@ -46,30 +52,54 @@ export function parseCliArguments(values: string[]): CliArguments {
 
 export async function runCli(): Promise<void> {
   const cliArguments = parseCliArguments(process.argv.slice(2));
-  configureWorkspace(cliArguments.workspace);
-  const runtimeConfig = await loadRuntime(cliArguments.workspace);
+  const workspacePath = configureWorkspace(cliArguments.workspace);
+  const runtimeConfig = await loadRuntime(workspacePath);
   configureSandbox(runtimeConfig.sandbox);
   const client = new OpenAI({
     apiKey: runtimeConfig.provider.AGENT_API_KEY,
     baseURL: runtimeConfig.provider.base_url,
   }) as unknown as ResponsesClient;
   const terminal = createInterface({ input: stdin, output: stdout });
-  const agent = new ReActRuntime(
-    client,
-    runtimeConfig.provider.model,
-    runtimeConfig.prompt,
-    runtimeConfig,
-    await loadTools(
-      undefined,
-      async (request) => approvalPrompt(terminal, request),
-    ),
-  );
 
   try {
     try {
       const question = await terminal.question("请输入任务: ");
-      const turn = await agent.runTurn(question);
-      console.log(turn.reply);
+      if (question.trim().length === 0) {
+        console.log("请输入要处理的内容。");
+        return;
+      }
+
+      const database = await initializeStateDatabase();
+      try {
+        console.warn(STATE_PRIVACY_NOTICE);
+        const store = new SessionStore(database, workspacePath);
+        const runtimeSession = prepareRuntimeSession(store, {
+          model: runtimeConfig.provider.model,
+          systemPrompt: runtimeConfig.prompt,
+        });
+        if (runtimeSession.restoredTurnCount > 0) {
+          console.log(`已恢复 ${runtimeSession.restoredTurnCount} 个完整回合。`);
+        }
+
+        const agent = new ReActRuntime(
+          client,
+          runtimeConfig.provider.model,
+          runtimeConfig.prompt,
+          runtimeConfig,
+          await loadTools(
+            undefined,
+            async (request) => approvalPrompt(terminal, request),
+          ),
+          {
+            recorder: runtimeSession.recorder,
+            initialItems: runtimeSession.initialItems,
+          },
+        );
+        const turn = await agent.runTurn(question);
+        console.log(turn.reply);
+      } finally {
+        database.close();
+      }
     } catch (error) {
       if (error instanceof Error && error.message === "readline was closed") return;
       throw error;

@@ -16,8 +16,9 @@
 - 命令执行：使用结构化 argv、`shell: false`、超时和输出截断。
 - Windows 沙箱：优先使用 WSL2 + bubblewrap，支持 strict 和显式 soft fallback。
 - SQLite 会话层：包含 Schema 迁移、外键、WAL、Session/Turn/Item 事务写入、Runtime 生命周期记录和完整 Turn 恢复。
+- CLI 会话恢复：按工作区自动恢复模型和系统 Prompt 均兼容的最近会话，配置变化时隔离创建新会话。
 
-> Runtime 已支持注入 SessionRecorder 和已恢复的 Responses Items；CLI 尚未自动创建、选择或恢复 Session。
+> CLI 当前自动接续最近的兼容会话；指定 Session、会话列表、删除和手动新建命令尚未实现。
 
 ## 环境要求
 
@@ -63,6 +64,8 @@ context_window = 400000
 `config/settings.toml` 是本地敏感配置，不应提交到版本库。仓库仅提供不含密钥的 `settings.example.toml`。
 
 配置的 Provider、`base_url` 和模型必须支持 `/responses`。项目不会静默回退到旧协议，接口不兼容时会返回明确错误。
+
+会话状态默认保存在用户目录的 `.coding-agent/state.sqlite`。数据库包含原始提问、模型输出和工具结果；CLI 在首次实际写入前会显示隐私提示。启动同一工作区时，仅当模型和系统 Prompt 的 SHA-256 指纹均一致才会恢复最近会话，否则会创建隔离的新 Session。
 
 ## 内置工具
 
@@ -135,9 +138,20 @@ coding-agent/
 
 ## 开发状态
 
-当前版本已完成 Responses API ReAct 工具链、权限模型、文件安全、Windows 沙箱框架，以及 Runtime 与 SessionStore 之间的可选记录接口。后续将实现 CLI 会话创建与恢复，再继续完善上下文管理。
+当前版本已完成 Responses API ReAct 工具链、权限模型、文件安全、Windows 沙箱框架、Runtime 会话记录接口和 CLI 自动会话恢复。后续将增加显式会话管理能力，再继续完善上下文压缩与容量控制。
 
 ## 更新记录
+
+### 2026-08-29
+
+- feat | 新增独立 Session 装配模块，集中处理系统 Prompt 指纹、最近 Session 兼容性判断、完整 Turn 恢复和 Runtime 注入参数，避免将恢复策略耦合到 CLI 或 Runtime。
+- CLI 收到非空任务后初始化用户级状态数据库，按规范化工作区查找最近 Session；首次使用时创建 Session，后续自动注入 SessionRecorder 与已恢复的 Responses Items。
+- 仅当模型标识与系统 Prompt 的 SHA-256 指纹均一致时恢复会话；模型或 Prompt 变化会创建新 Session，防止不兼容的消息、推理项和工具上下文混入新请求。
+- 恢复时沿用 SessionStore 的完整 Turn 边界，只重放 completed Turn；上次进程遗留的 running Turn 会标记为 interrupted，不进入模型上下文。
+- 空输入不会初始化数据库或创建空 Session；数据库、WAL 连接和终端均通过明确的资源生命周期关闭，启动或运行失败不会遗留打开的数据库句柄。
+- CLI 显示本地状态隐私提示，并在实际恢复到历史时报告完整回合数量；状态默认保存在用户目录 `.coding-agent/state.sqlite`。
+- 补充首次 Session 创建、兼容会话恢复、未完成回合排除、模型变化和 Prompt 变化隔离测试。
+- 验证结果：`npm run typecheck` 通过；`npm test` 共 63 项测试，62 项通过，1 项真实 WSL2 沙箱测试因环境条件跳过。
 
 ### 2026-08-28
 
