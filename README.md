@@ -17,6 +17,7 @@
 - Windows 沙箱：优先使用 WSL2 + bubblewrap，支持 strict 和显式 soft fallback。
 - SQLite 会话层：包含 Schema 迁移、外键、WAL、Session/Turn/Item 事务写入、Runtime 生命周期记录和完整 Turn 恢复。
 - CLI 会话恢复：按工作区自动恢复模型和系统 Prompt 均兼容的最近会话，配置变化时隔离创建新会话。
+- CLI 多轮交互：同一进程内复用 Runtime 和 Session，支持连续处理任务，单轮失败不会阻断后续输入。
 
 > CLI 当前自动接续最近的兼容会话；指定 Session、会话列表、删除和手动新建命令尚未实现。
 
@@ -65,7 +66,7 @@ context_window = 400000
 
 配置的 Provider、`base_url` 和模型必须支持 `/responses`。项目不会静默回退到旧协议，接口不兼容时会返回明确错误。
 
-会话状态默认保存在用户目录的 `.coding-agent/state.sqlite`。数据库包含原始提问、模型输出和工具结果；CLI 在首次实际写入前会显示隐私提示。启动同一工作区时，仅当模型和系统 Prompt 的 SHA-256 指纹均一致才会恢复最近会话，否则会创建隔离的新 Session。
+会话状态默认保存在用户目录的 `.coding-agent/state.sqlite`。数据库包含原始提问、模型输出和工具结果；CLI 在首次实际任务前显示隐私提示。启动同一工作区时，仅当模型和系统 Prompt 的 SHA-256 指纹均一致才会恢复最近会话，否则会创建隔离的新 Session。输入 `exit` 或 `quit` 可退出交互循环。
 
 ## 内置工具
 
@@ -138,9 +139,18 @@ coding-agent/
 
 ## 开发状态
 
-当前版本已完成 Responses API ReAct 工具链、权限模型、文件安全、Windows 沙箱框架、Runtime 会话记录接口和 CLI 自动会话恢复。后续将增加显式会话管理能力，再继续完善上下文压缩与容量控制。
+当前版本已完成 Responses API ReAct 工具链、权限模型、文件安全、Windows 沙箱框架、Runtime 会话记录接口、CLI 自动会话恢复和多轮交互。后续将增加显式会话管理能力，再继续完善上下文压缩与容量控制。
 
 ## 更新记录
+
+### 2026-09-02
+
+- feat | 将 CLI 改为持续多轮交互循环，同一进程内复用已恢复的 ReActRuntime、SessionRecorder 和 SQLite Session，避免每个任务重复初始化会话上下文。
+- 支持 `exit` 和 `quit` 明确退出；空输入只提示并跳过，单轮模型或工具失败通过错误回调报告后继续接收下一轮任务。
+- 将数据库与 Agent 改为首次有效任务时惰性初始化，用户直接退出或只输入空内容时不会创建空 Session；无论正常退出、输入关闭还是运行异常，均统一关闭数据库和终端。
+- 抽取可独立测试的 `runInteractiveSession`，将输入循环、退出规则和单轮错误恢复与 CLI 资源装配解耦，为后续显式会话命令保留扩展边界。
+- 补充多轮成功、空输入、单轮失败后继续、退出和 readline 关闭测试。
+- 验证结果：`npm run typecheck` 通过；`npm test` 共 66 项测试，65 项通过，1 项真实 WSL2 沙箱测试因环境条件跳过。
 
 ### 2026-08-29
 
