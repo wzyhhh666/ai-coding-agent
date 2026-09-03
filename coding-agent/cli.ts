@@ -4,9 +4,15 @@ import type { DatabaseSync } from "node:sqlite";
 
 import OpenAI from "openai";
 
+import { parseCliInput, type CliCommand } from "./cli_commands.ts";
 import { loadRuntime } from "./config.ts";
 import { ReActRuntime, type ResponsesClient } from "./runtime.ts";
-import { prepareRuntimeSession } from "./session/bootstrap.ts";
+import {
+  createRuntimeSession,
+  prepareRuntimeSession,
+  type PreparedRuntimeSession,
+  restoreRuntimeSession,
+} from "./session/bootstrap.ts";
 import { SessionStore } from "./session/store.ts";
 import {
   initializeStateDatabase,
@@ -22,12 +28,15 @@ export type CliArguments = {
 export type InteractiveSessionOptions = {
   ask: () => Promise<string>;
   handleInput: (input: string) => Promise<void>;
+  handleCommand?: (command: CliCommand) => Promise<void>;
   onError?: (error: unknown) => void;
+  write?: (message: string) => void;
 };
 
 export async function runInteractiveSession(
   options: InteractiveSessionOptions,
 ): Promise<void> {
+  const write = options.write ?? console.log;
   while (true) {
     let input: string;
     try {
@@ -37,17 +46,21 @@ export async function runInteractiveSession(
       throw error;
     }
 
-    if (input.trim().toLocaleLowerCase() === "exit" ||
-      input.trim().toLocaleLowerCase() === "quit") {
-      return;
-    }
-    if (input.trim().length === 0) {
-      console.log("请输入要处理的内容，输入 exit 退出。");
+    const parsed = parseCliInput(input);
+    if (parsed.type === "exit") return;
+    if (parsed.type === "empty") {
+      write("请输入要处理的内容，输入 /help 查看命令。");
       continue;
     }
 
     try {
-      await options.handleInput(input);
+      if (parsed.type === "task") {
+        await options.handleInput(parsed.input);
+      } else if (options.handleCommand !== undefined) {
+        await options.handleCommand(parsed);
+      } else if (parsed.type === "invalid") {
+        write(parsed.message);
+      }
     } catch (error) {
       if (error instanceof Error && error.message === "readline was closed") return;
       if (options.onError) {
@@ -102,48 +115,121 @@ export async function runCli(): Promise<void> {
   }) as unknown as ResponsesClient;
   const terminal = createInterface({ input: stdin, output: stdout });
   let database: DatabaseSync | undefined;
+  let store: SessionStore | undefined;
   let agent: ReActRuntime | undefined;
+  let activeSessionId: string | undefined;
+
+  const sessionInput = {
+    model: runtimeConfig.provider.model,
+    systemPrompt: runtimeConfig.prompt,
+  };
+
+  async function requireStore(): Promise<SessionStore> {
+    if (store !== undefined) return store;
+
+    const openedDatabase = await initializeStateDatabase();
+    try {
+      const openedStore = new SessionStore(openedDatabase, workspacePath);
+      database = openedDatabase;
+      store = openedStore;
+      console.warn(STATE_PRIVACY_NOTICE);
+      return openedStore;
+    } catch (error) {
+      openedDatabase.close();
+      throw error;
+    }
+  }
+
+  async function activateSession(
+    runtimeSession: PreparedRuntimeSession,
+  ): Promise<ReActRuntime> {
+    const nextAgent = new ReActRuntime(
+      client,
+      runtimeConfig.provider.model,
+      runtimeConfig.prompt,
+      runtimeConfig,
+      await loadTools(
+        undefined,
+        async (request) => approvalPrompt(terminal, request),
+      ),
+      {
+        recorder: runtimeSession.recorder,
+        initialItems: runtimeSession.initialItems,
+      },
+    );
+    agent = nextAgent;
+    activeSessionId = runtimeSession.session.id;
+    return nextAgent;
+  }
+
+  async function requireAgent(): Promise<ReActRuntime> {
+    if (agent !== undefined) return agent;
+    const runtimeSession = prepareRuntimeSession(await requireStore(), sessionInput);
+    const restoredAgent = await activateSession(runtimeSession);
+    if (runtimeSession.restoredTurnCount > 0) {
+      console.log(`已恢复 ${runtimeSession.restoredTurnCount} 个完整回合。`);
+    }
+    return restoredAgent;
+  }
 
   try {
     await runInteractiveSession({
       ask: () => terminal.question("请输入任务（输入 exit 退出）: "),
       handleInput: async (input) => {
-        if (agent === undefined) {
-          database = await initializeStateDatabase();
-          try {
-            console.warn(STATE_PRIVACY_NOTICE);
-            const store = new SessionStore(database, workspacePath);
-            const runtimeSession = prepareRuntimeSession(store, {
-              model: runtimeConfig.provider.model,
-              systemPrompt: runtimeConfig.prompt,
-            });
-            if (runtimeSession.restoredTurnCount > 0) {
-              console.log(`已恢复 ${runtimeSession.restoredTurnCount} 个完整回合。`);
-            }
-
-            agent = new ReActRuntime(
-              client,
-              runtimeConfig.provider.model,
-              runtimeConfig.prompt,
-              runtimeConfig,
-              await loadTools(
-                undefined,
-                async (request) => approvalPrompt(terminal, request),
-              ),
-              {
-                recorder: runtimeSession.recorder,
-                initialItems: runtimeSession.initialItems,
-              },
-            );
-          } catch (error) {
-            database.close();
-            database = undefined;
-            throw error;
-          }
+        const turn = await (await requireAgent()).runTurn(input);
+        console.log(turn.reply);
+      },
+      handleCommand: async (command) => {
+        if (command.type === "help") {
+          console.log(
+            "/sessions 列出会话 | /new [标题] 新建会话 | " +
+              "/switch <session-id> 切换会话 | /exit 退出",
+          );
+          return;
+        }
+        if (command.type === "invalid") {
+          console.log(command.message);
+          return;
         }
 
-        const turn = await agent.runTurn(input);
-        console.log(turn.reply);
+        const sessionStore = await requireStore();
+        if (command.type === "list-sessions") {
+          const sessions = sessionStore.listSessions();
+          if (sessions.length === 0) {
+            console.log("当前工作区没有会话。");
+            return;
+          }
+          for (const session of sessions) {
+            const marker = session.id === activeSessionId ? "*" : " ";
+            const title = session.title ?? "未命名会话";
+            console.log(
+              `${marker} ${session.id} | ${title} | ${session.lastModel ?? "未知模型"}`,
+            );
+          }
+          return;
+        }
+        if (command.type === "new-session") {
+          const created = createRuntimeSession(
+            sessionStore,
+            sessionInput,
+            command.title,
+          );
+          await activateSession(created);
+          console.log(`已创建并切换到 Session: ${created.session.id}`);
+          return;
+        }
+        if (command.type === "switch-session") {
+          const restored = restoreRuntimeSession(
+            sessionStore,
+            command.sessionId,
+            sessionInput,
+          );
+          await activateSession(restored);
+          console.log(
+            `已切换到 Session: ${restored.session.id}，恢复 ` +
+              `${restored.restoredTurnCount} 个完整回合。`,
+          );
+        }
       },
       onError: (error) => {
         console.error(`本轮执行失败: ${error instanceof Error ? error.message : error}`);

@@ -27,25 +27,26 @@ export function prepareRuntimeSession(
   store: SessionStore,
   input: RuntimeSessionInput,
 ): PreparedRuntimeSession {
-  const promptHash = systemPromptHash(input.systemPrompt);
   const latestSession = store.findLatestSession();
 
-  if (
-    latestSession?.lastModel === input.model &&
-    latestSession.systemPromptHash === promptHash
-  ) {
-    const restored = store.restoreSession(latestSession.id);
-    return {
-      session: restored.session,
-      recorder: store.recorder(restored.session.id),
-      initialItems: restoredItems(restored),
-      restoredTurnCount: restored.turns.length,
-    };
+  if (latestSession !== undefined && isCompatible(latestSession, input)) {
+    return restoreRuntimeSession(store, latestSession.id, input);
   }
 
+  return createRuntimeSession(store, input);
+}
+
+export function createRuntimeSession(
+  store: SessionStore,
+  input: RuntimeSessionInput,
+  title?: string,
+): PreparedRuntimeSession {
+  const normalizedTitle = title?.trim();
+
   const session = store.createSession({
+    ...(normalizedTitle ? { title: normalizedTitle } : {}),
     model: input.model,
-    systemPromptHash: promptHash,
+    systemPromptHash: systemPromptHash(input.systemPrompt),
   });
   return {
     session,
@@ -53,4 +54,33 @@ export function prepareRuntimeSession(
     initialItems: [],
     restoredTurnCount: 0,
   };
+}
+
+export function restoreRuntimeSession(
+  store: SessionStore,
+  sessionId: string,
+  input: RuntimeSessionInput,
+): PreparedRuntimeSession {
+  const session = store.getSession(sessionId);
+  if (!isCompatible(session, input)) {
+    throw new Error(
+      `Session ${sessionId} 的模型或系统 Prompt 与当前配置不兼容`,
+    );
+  }
+
+  const restored = store.restoreSession(sessionId);
+  return {
+    session: restored.session,
+    recorder: store.recorder(restored.session.id),
+    initialItems: restoredItems(restored),
+    restoredTurnCount: restored.turns.length,
+  };
+}
+
+function isCompatible(
+  session: SessionRecord,
+  input: RuntimeSessionInput,
+): boolean {
+  return session.lastModel === input.model &&
+    session.systemPromptHash === systemPromptHash(input.systemPrompt);
 }

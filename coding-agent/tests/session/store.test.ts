@@ -82,6 +82,29 @@ test("SessionStore 创建 Session 并按工作区查找最近记录", async () =
   }
 });
 
+test("SessionStore 按更新时间列出当前工作区会话并限制数量", async () => {
+  const context = await createTestContext();
+  try {
+    const store = new SessionStore(context.database, "./workspace", {
+      now: values([1, 2, 3]),
+      createId: values(["session-1", "session-2", "session-3"]),
+    });
+    store.createSession({ title: "first" });
+    store.createSession({ title: "second" });
+    store.createSession({ title: "third" });
+
+    assert.deepEqual(
+      store.listSessions(2).map((session) => session.id),
+      ["session-3", "session-2"],
+    );
+    assert.equal(store.getSession("session-1").title, "first");
+    assert.throws(() => store.listSessions(0), /1 到 100/);
+    assert.throws(() => store.listSessions(101), /1 到 100/);
+  } finally {
+    await closeTestContext(context);
+  }
+});
+
 test("SessionStore 按顺序保存完整 Responses Items 并只恢复 completed Turn", async () => {
   const context = await createTestContext();
   try {

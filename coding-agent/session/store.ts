@@ -218,6 +218,23 @@ export class SessionStore {
     return result === undefined ? undefined : sessionFromRow(result);
   }
 
+  listSessions(limit = 20): SessionRecord[] {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new Error("Session 查询数量必须是 1 到 100 之间的整数");
+    }
+    return this.database.prepare(`
+      SELECT *
+      FROM sessions
+      WHERE workspace_key = ?
+      ORDER BY updated_at DESC, created_at DESC, id DESC
+      LIMIT ?
+    `).all(this.workspaceKey, limit).map(sessionFromRow);
+  }
+
+  getSession(sessionId: string): SessionRecord {
+    return this.requireSessionForWorkspace(sessionId);
+  }
+
   startTurn(sessionId: string, userInput: string): string {
     return this.transaction(() => {
       this.requireSessionForWorkspace(sessionId);

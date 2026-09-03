@@ -6,7 +6,9 @@ import type { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import {
+  createRuntimeSession,
   prepareRuntimeSession,
+  restoreRuntimeSession,
   systemPromptHash,
 } from "../../session/bootstrap.ts";
 import { SessionStore } from "../../session/store.ts";
@@ -161,6 +163,33 @@ test("prepareRuntimeSession 在模型或 Prompt 变化时创建新 Session", asy
     assert.notEqual(
       changedModel.session.systemPromptHash,
       changedPrompt.session.systemPromptHash,
+    );
+  } finally {
+    await closeTestContext(context);
+  }
+});
+
+test("显式新建支持标题，按 ID 恢复会校验当前配置", async () => {
+  const context = await createTestContext();
+  try {
+    const store = new SessionStore(context.database, "./workspace", {
+      now: sequence([1, 2, 3]),
+      createId: sequence(["session-1", "session-2"]),
+    });
+    const input = { model: "model-a", systemPrompt: "prompt-a" };
+    const first = createRuntimeSession(store, input, "  第一项任务  ");
+    createRuntimeSession(store, input, "第二项任务");
+
+    const restored = restoreRuntimeSession(store, first.session.id, input);
+
+    assert.equal(first.session.title, "第一项任务");
+    assert.equal(restored.session.id, "session-1");
+    assert.throws(
+      () => restoreRuntimeSession(store, first.session.id, {
+        model: "model-b",
+        systemPrompt: "prompt-a",
+      }),
+      /不兼容/,
     );
   } finally {
     await closeTestContext(context);
