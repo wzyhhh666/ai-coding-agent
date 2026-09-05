@@ -37,6 +37,10 @@ export type Runtime = {
   provider: Provider;
   prompt: string;
   maxSteps: number;
+  compaction: {
+    triggerRatio: number;
+    keepRecentTurns: number;
+  };
   sandbox: SandboxConfig;
 };
 
@@ -106,6 +110,21 @@ export async function loadRuntime(root = BASE_DIR): Promise<Runtime> {
   const maxSteps = agentConfig.max_steps ?? 10;
   if (!Number.isInteger(maxSteps) || Number(maxSteps) < 1)
     throw new Error("max_steps 必须是正整数");
+  const compactionTriggerRatio = agentConfig.compaction_trigger_ratio ?? 0.8;
+  if (
+    typeof compactionTriggerRatio !== "number" ||
+    compactionTriggerRatio <= 0 ||
+    compactionTriggerRatio >= 1
+  ) {
+    throw new Error("compaction_trigger_ratio 必须是 0 到 1 之间的数字");
+  }
+  const compactionKeepRecentTurns = agentConfig.compaction_keep_recent_turns ?? 2;
+  if (
+    !Number.isInteger(compactionKeepRecentTurns) ||
+    Number(compactionKeepRecentTurns) < 1
+  ) {
+    throw new Error("compaction_keep_recent_turns 必须是正整数");
+  }
   const sandboxConfig = record(config.sandbox);
   const mode = String(sandboxConfig.mode ?? "auto");
   if (!["auto", "soft", "strict"].includes(mode))
@@ -155,6 +174,10 @@ export async function loadRuntime(root = BASE_DIR): Promise<Runtime> {
     },
     prompt,
     maxSteps: Number(maxSteps),
+    compaction: {
+      triggerRatio: compactionTriggerRatio,
+      keepRecentTurns: Number(compactionKeepRecentTurns),
+    },
     sandbox: {
       mode: mode as SandboxMode,
       backend: backend as SandboxBackend,

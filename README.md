@@ -19,6 +19,7 @@
 - CLI 会话恢复：按工作区自动恢复模型和系统 Prompt 均兼容的最近会话，配置变化时隔离创建新会话。
 - CLI 多轮交互：同一进程内复用 Runtime 和 Session，支持连续处理任务，单轮失败不会阻断后续输入。
 - 显式会话管理：支持列出、新建和切换当前工作区会话，切换时校验模型与系统 Prompt 兼容性。
+- 上下文压缩：根据 Responses API 返回的输入 token 用量自动摘要较早 Turn，同时保留近期完整工具上下文。
 
 > CLI 支持自动接续和显式切换；会话重命名与删除命令尚未实现。
 
@@ -55,6 +56,8 @@ active_provider = "openai"
 [agent]
 prompt = "react"
 max_steps = 10
+compaction_trigger_ratio = 0.8
+compaction_keep_recent_turns = 2
 
 [providers.openai]
 AGENT_API_KEY = ""
@@ -80,6 +83,8 @@ context_window = 400000
 | `/exit` | 退出程序 |
 
 显式切换仍遵守工作区、模型和系统 Prompt 指纹隔离规则。不属于当前工作区或与当前配置不兼容的 Session 会被拒绝，原活动会话不会受到影响。
+
+上下文压缩在请求的 `usage.input_tokens` 达到 `context_window × compaction_trigger_ratio` 后触发。较早的完整 Turn 会合并为持久化摘要，最近 `compaction_keep_recent_turns` 个 Turn 保留原始 Responses Items。压缩请求不启用工具并继续使用 `store: false`；压缩失败时保留完整历史，不会把已经成功的用户 Turn 改为失败。
 
 ## 内置工具
 
@@ -152,9 +157,21 @@ coding-agent/
 
 ## 开发状态
 
-当前版本已完成 Responses API ReAct 工具链、权限模型、文件安全、Windows 沙箱框架、Runtime 会话记录接口、CLI 自动恢复、多轮交互和显式会话切换。后续将完善上下文压缩与容量控制。
+当前版本已完成 Responses API ReAct 工具链、权限模型、文件安全、Windows 沙箱框架、Runtime 会话记录接口、CLI 多轮会话管理和自动上下文压缩。后续将继续完善流式输出与长任务执行能力。
 
 ## 更新记录
+
+### 2026-09-05
+
+- feat | 接通上下文容量管理闭环，根据 Responses API 返回的 `usage.input_tokens` 与模型 `context_window` 计算触发阈值，不使用字符数或本地估算替代服务端 token 统计。
+- 新增 `compaction_trigger_ratio` 和 `compaction_keep_recent_turns` 配置，默认在上下文窗口使用率达到 80% 后尝试压缩，并保留最近 2 个完整 Turn；配置加载时严格校验范围。
+- SessionStore 基于已完成 Turn 生成增量压缩候选，只提交上次摘要之后新进入压缩区间的 Items，同时保留近期 Turn 的完整 Responses Items。
+- 使用已有 `compactions` 表事务保存摘要和截止 Turn 序号，要求截止序号对应 completed Turn 且只能单调向前推进；本次不修改 Schema，也不增加迁移版本。
+- Runtime 使用独立、无工具、`store: false` 的 Responses 请求生成中文执行摘要，并明确将历史输入视为待总结数据，保留目标、决策、文件变化、工具结果、约束和未完成事项。
+- 压缩成功后以内存中的“摘要 Item + 近期完整 Items”替换全量历史；进程重启或显式切换会话时使用同样结构恢复，不重复发送已经摘要的旧 Items。
+- 压缩属于成功 Turn 之后的维护操作；请求、解析或持久化失败时仅输出警告并保留完整上下文，不覆盖用户回复、不回滚已完成 Turn。
+- 补充压缩配置、token 阈值、无工具摘要请求、内存上下文替换、失败降级、候选划分、摘要恢复裁剪和单调写入测试。
+- 验证结果：`npm run typecheck` 通过；`npm test` 共 75 项测试，74 项通过，1 项真实 WSL2 沙箱测试因环境条件跳过。
 
 ### 2026-09-04
 

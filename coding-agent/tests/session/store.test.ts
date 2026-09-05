@@ -325,3 +325,60 @@ test("restoredItems 按已恢复 Turn 顺序展开 Responses Items", () => {
 
   assert.deepEqual(items, [first, second]);
 });
+
+test("SessionStore 生成压缩候选并用摘要裁剪恢复上下文", async () => {
+  const context = await createTestContext();
+  try {
+    let timestamp = 0;
+    const store = new SessionStore(context.database, "./workspace", {
+      now: () => {
+        timestamp += 1;
+        return timestamp;
+      },
+      createId: values([
+        "session-1",
+        "turn-1",
+        "turn-2",
+        "turn-3",
+        "turn-4",
+      ]),
+    });
+    const session = store.createSession();
+    for (let sequence = 1; sequence <= 4; sequence += 1) {
+      const turnId = store.startTurn(session.id, `user-${sequence}`);
+      store.appendItem(turnId, {
+        role: "assistant",
+        content: `assistant-${sequence}`,
+      });
+      store.completeTurn(turnId);
+    }
+
+    const candidate = store.prepareCompaction(session.id, 2);
+    assert.equal(candidate?.throughTurnSequence, 2);
+    assert.equal(candidate?.items.length, 4);
+    assert.deepEqual(candidate?.recentItems, [
+      { role: "user", content: "user-3" },
+      { role: "assistant", content: "assistant-3" },
+      { role: "user", content: "user-4" },
+      { role: "assistant", content: "assistant-4" },
+    ]);
+
+    store.saveCompaction(session.id, "summary-1", 2);
+    const restored = store.restoreSession(session.id);
+    assert.deepEqual(restoredItems(restored), [
+      {
+        type: "message",
+        role: "system",
+        content: "会话历史摘要：\nsummary-1",
+      },
+      ...candidate!.recentItems,
+    ]);
+    assert.equal(store.prepareCompaction(session.id, 2), undefined);
+    assert.throws(
+      () => store.saveCompaction(session.id, "older", 2),
+      /必须向前推进/,
+    );
+  } finally {
+    await closeTestContext(context);
+  }
+});

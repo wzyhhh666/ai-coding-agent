@@ -3,6 +3,7 @@ import test from "node:test";
 
 import type { Runtime } from "../config.ts";
 import {
+  compactionItem,
   ReActRuntime,
   type ResponsesClient,
   type ResponsesRequest,
@@ -19,18 +20,23 @@ const runtimeConfig: Runtime = {
   },
   prompt: "test prompt",
   maxSteps: 3,
+  compaction: { triggerRatio: 0.8, keepRecentTurns: 2 },
   sandbox: { mode: "auto", backend: "auto", allowSoftFallback: true },
 };
 
 function response(
   output: Array<Record<string, unknown>>,
   outputText = "",
+  inputTokens?: number,
 ) {
   return {
     id: "resp-test",
     status: "completed" as const,
     output,
     output_text: outputText,
+    ...(inputTokens === undefined
+      ? {}
+      : { usage: { input_tokens: inputTokens } }),
   };
 }
 
@@ -625,4 +631,88 @@ test("ReActRuntime 空输入不创建持久化 Turn", async () => {
   await runtime.runTurn("  ", () => undefined);
 
   assert.deepEqual(events, []);
+});
+
+test("ReActRuntime 超过 token 阈值后压缩旧 Turn 并替换内存上下文", async () => {
+  const requests: ResponsesRequest[] = [];
+  const saved: Array<{ summary: string; through: number }> = [];
+  let normalRequestCount = 0;
+  const recorder = recordingSession([]);
+  recorder.prepareCompaction = async (keepRecentTurns) => {
+    assert.equal(keepRecentTurns, 2);
+    return {
+      throughTurnSequence: 2,
+      items: [{ role: "user", content: "old" }],
+      recentItems: [{ role: "assistant", content: "recent" }],
+    };
+  };
+  recorder.saveCompaction = async (summary, throughTurnSequence) => {
+    saved.push({ summary, through: throughTurnSequence });
+  };
+  const client: ResponsesClient = {
+    responses: { async create(request) {
+      requests.push(request);
+      if (request.instructions.startsWith("请将以下较早")) {
+        return response([message("summary")], "summary");
+      }
+      normalRequestCount += 1;
+      return normalRequestCount === 1
+        ? response([message("first reply")], "first reply", 850)
+        : response([message("second reply")], "second reply", 100);
+    } },
+  };
+  const runtime = new ReActRuntime(
+    client,
+    "test-model",
+    "test prompt",
+    runtimeConfig,
+    emptyTools(),
+    { recorder },
+  );
+
+  await runtime.runTurn("first", () => undefined);
+  await runtime.runTurn("second", () => undefined);
+
+  assert.deepEqual(saved, [{ summary: "summary", through: 2 }]);
+  assert.equal("tools" in requests[1]!, false);
+  assert.deepEqual(requests[2]?.input.slice(0, 3), [
+    compactionItem("summary"),
+    { role: "assistant", content: "recent" },
+    { role: "user", content: "second" },
+  ]);
+});
+
+test("ReActRuntime 压缩失败不破坏成功回合和完整上下文", async () => {
+  const requests: ResponsesRequest[] = [];
+  const warnings: string[] = [];
+  const recorder = recordingSession([]);
+  recorder.prepareCompaction = async () => {
+    throw new Error("compaction unavailable");
+  };
+  recorder.saveCompaction = async () => undefined;
+  const client: ResponsesClient = {
+    responses: { async create(request) {
+      requests.push(request);
+      const reply = requests.length === 1 ? "first reply" : "second reply";
+      return response([message(reply)], reply, requests.length === 1 ? 900 : 100);
+    } },
+  };
+  const runtime = new ReActRuntime(
+    client,
+    "test-model",
+    "test prompt",
+    runtimeConfig,
+    emptyTools(),
+    { recorder },
+  );
+
+  const first = await runtime.runTurn("first", (line) => warnings.push(line));
+  await runtime.runTurn("second", () => undefined);
+
+  assert.equal(first.reply, "first reply");
+  assert.match(warnings.at(-1) ?? "", /上下文压缩失败.*compaction unavailable/);
+  assert.deepEqual(
+    requests[1]?.input.map((item) => item.role ?? item.type),
+    ["user", "assistant", "user"],
+  );
 });

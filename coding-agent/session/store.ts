@@ -2,9 +2,11 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
-import type {
-  ResponseInputItem,
-  SessionRecorder,
+import {
+  compactionItem,
+  type CompactionInput,
+  type ResponseInputItem,
+  type SessionRecorder,
 } from "../runtime.ts";
 
 export type SessionRecord = {
@@ -37,10 +39,25 @@ export type RestoredTurn = TurnRecord & {
 export type RestoredSession = {
   session: SessionRecord;
   turns: RestoredTurn[];
+  compaction?: CompactionRecord;
+};
+
+export type CompactionRecord = {
+  sessionId: string;
+  summary: string;
+  throughTurnSequence: number;
+  updatedAt: number;
 };
 
 export function restoredItems(session: RestoredSession): ResponseInputItem[] {
-  return session.turns.flatMap((turn) => turn.items);
+  const compaction = session.compaction;
+  if (compaction === undefined) {
+    return session.turns.flatMap((turn) => turn.items);
+  }
+  const recentItems = session.turns
+    .filter((turn) => turn.sequence > compaction.throughTurnSequence)
+    .flatMap((turn) => turn.items);
+  return [compactionItem(compaction.summary), ...recentItems];
 }
 
 export type CreateSessionInput = {
@@ -118,6 +135,19 @@ function turnFromRow(value: unknown): TurnRecord {
     startedAt: numberValue(data.started_at, "turns.started_at"),
     completedAt: nullableNumber(data.completed_at, "turns.completed_at"),
     error: nullableString(data.error, "turns.error"),
+  };
+}
+
+function compactionFromRow(value: unknown): CompactionRecord {
+  const data = row(value);
+  return {
+    sessionId: stringValue(data.session_id, "compactions.session_id"),
+    summary: stringValue(data.summary, "compactions.summary"),
+    throughTurnSequence: numberValue(
+      data.through_turn_sequence,
+      "compactions.through_turn_sequence",
+    ),
+    updatedAt: numberValue(data.updated_at, "compactions.updated_at"),
   };
 }
 
@@ -300,17 +330,91 @@ export class SessionStore {
       `).all(sessionId);
       const turns = turnRows.map((turnRow) => {
         const turn = turnFromRow(turnRow);
-        const items = this.database.prepare(`
-          SELECT payload_json
-          FROM items
-          WHERE session_id = ? AND turn_id = ?
-          ORDER BY sequence ASC
-        `).all(sessionId, turn.id).map((itemRow) => {
-          return deserializeItem(row(itemRow).payload_json);
-        });
-        return { ...turn, items };
+        return { ...turn, items: this.turnItems(sessionId, turn.id) };
       });
-      return { session, turns };
+      const compaction = this.findCompaction(sessionId);
+      return {
+        session,
+        turns,
+        ...(compaction === undefined ? {} : { compaction }),
+      };
+    });
+  }
+
+  prepareCompaction(
+    sessionId: string,
+    keepRecentTurns: number,
+  ): CompactionInput | undefined {
+    if (!Number.isInteger(keepRecentTurns) || keepRecentTurns < 1) {
+      throw new Error("压缩保留 Turn 数必须是正整数");
+    }
+    this.requireSessionForWorkspace(sessionId);
+    const turns = this.database.prepare(`
+      SELECT * FROM turns
+      WHERE session_id = ? AND status = 'completed'
+      ORDER BY sequence ASC
+    `).all(sessionId).map(turnFromRow);
+    if (turns.length <= keepRecentTurns) return undefined;
+
+    const compactedTurns = turns.slice(0, -keepRecentTurns);
+    const throughTurnSequence = compactedTurns.at(-1)!.sequence;
+    const previous = this.findCompaction(sessionId);
+    if (previous !== undefined &&
+      previous.throughTurnSequence >= throughTurnSequence) {
+      return undefined;
+    }
+
+    const items = compactedTurns
+      .filter((turn) => turn.sequence > (previous?.throughTurnSequence ?? 0))
+      .flatMap((turn) => this.turnItems(sessionId, turn.id));
+    const recentItems = turns
+      .filter((turn) => turn.sequence > throughTurnSequence)
+      .flatMap((turn) => this.turnItems(sessionId, turn.id));
+    return {
+      ...(previous === undefined ? {} : { previousSummary: previous.summary }),
+      throughTurnSequence,
+      items,
+      recentItems,
+    };
+  }
+
+  saveCompaction(
+    sessionId: string,
+    summary: string,
+    throughTurnSequence: number,
+  ): void {
+    const normalizedSummary = summary.trim();
+    if (normalizedSummary.length === 0) throw new Error("压缩摘要不能为空");
+    if (!Number.isInteger(throughTurnSequence) || throughTurnSequence < 1) {
+      throw new Error("压缩截止 Turn 序号必须是正整数");
+    }
+
+    this.transaction(() => {
+      this.requireSessionForWorkspace(sessionId);
+      const completedTurn = this.database.prepare(`
+        SELECT 1 AS found FROM turns
+        WHERE session_id = ? AND sequence = ? AND status = 'completed'
+      `).get(sessionId, throughTurnSequence);
+      if (completedTurn === undefined) {
+        throw new Error("压缩截止 Turn 尚未完成或不存在");
+      }
+      const previous = this.findCompaction(sessionId);
+      if (previous !== undefined &&
+        throughTurnSequence <= previous.throughTurnSequence) {
+        throw new Error("压缩截止 Turn 必须向前推进");
+      }
+
+      const timestamp = this.now();
+      this.database.prepare(`
+        INSERT INTO compactions
+          (session_id, summary, through_turn_sequence, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+          summary = excluded.summary,
+          through_turn_sequence = excluded.through_turn_sequence,
+          updated_at = excluded.updated_at
+      `).run(sessionId, normalizedSummary, throughTurnSequence, timestamp);
+      this.touchSession(sessionId, timestamp);
     });
   }
 
@@ -321,7 +425,34 @@ export class SessionStore {
       appendItem: async (turnId, item) => this.appendItem(turnId, item),
       completeTurn: async (turnId) => this.completeTurn(turnId),
       failTurn: async (turnId, error) => this.failTurn(turnId, error),
+      prepareCompaction: async (keepRecentTurns) => {
+        return this.prepareCompaction(sessionId, keepRecentTurns);
+      },
+      saveCompaction: async (summary, throughTurnSequence) => {
+        this.saveCompaction(sessionId, summary, throughTurnSequence);
+      },
     };
+  }
+
+  private findCompaction(sessionId: string): CompactionRecord | undefined {
+    const result = this.database.prepare(`
+      SELECT * FROM compactions WHERE session_id = ?
+    `).get(sessionId);
+    return result === undefined ? undefined : compactionFromRow(result);
+  }
+
+  private turnItems(
+    sessionId: string,
+    turnId: string,
+  ): ResponseInputItem[] {
+    return this.database.prepare(`
+      SELECT payload_json
+      FROM items
+      WHERE session_id = ? AND turn_id = ?
+      ORDER BY sequence ASC
+    `).all(sessionId, turnId).map((itemRow) => {
+      return deserializeItem(row(itemRow).payload_json);
+    });
   }
 
   private requireSession(sessionId: string): SessionRecord {

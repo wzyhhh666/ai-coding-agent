@@ -3,6 +3,8 @@ active_provider = "openai"
 [agent]
 prompt = "react"
 max_steps = 10
+compaction_trigger_ratio = 0.8
+compaction_keep_recent_turns = 2
 
 [sandbox]
 mode = "auto"
