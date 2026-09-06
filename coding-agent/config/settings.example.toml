@@ -3,6 +3,7 @@ active_provider = "openai"
 [agent]
 prompt = "react"
 max_steps = 10
+streaming = true
 compaction_trigger_ratio = 0.8
 compaction_keep_recent_turns = 2
 

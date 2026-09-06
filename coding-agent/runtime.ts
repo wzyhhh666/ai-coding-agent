@@ -5,6 +5,7 @@ import { toResponseTools } from "./tools/registry.ts";
 export type RuntimeTurn = {
   input: string;
   reply: string;
+  streamed: boolean;
 };
 
 export type ResponseInputItem = Record<string, unknown> & {
@@ -80,11 +81,18 @@ export type ResponsesRequest = {
   include: ["reasoning.encrypted_content"];
   tools?: ResponseToolSpec[];
   tool_choice?: "auto";
+  stream?: boolean;
 };
+
+export type ResponseStreamEvent = Record<string, unknown> & { type: string };
+
+export type ResponseEventStream = AsyncIterable<ResponseStreamEvent>;
 
 export type ResponsesClient = {
   responses: {
-    create(request: ResponsesRequest): Promise<ModelResponse>;
+    create(
+      request: ResponsesRequest,
+    ): Promise<ModelResponse | ResponseEventStream>;
   };
 };
 
@@ -171,6 +179,22 @@ function inputTokenCount(response: ModelResponse): number | undefined {
     : undefined;
 }
 
+function isEventStream(
+  value: ModelResponse | ResponseEventStream,
+): value is ResponseEventStream {
+  return Symbol.asyncIterator in value;
+}
+
+function emitSafely(callback: (text: string) => void, text: string): boolean {
+  try {
+    callback(text);
+    return true;
+  } catch {
+    // 终端或 UI 输出失败不应改变模型调用、工具执行和持久化语义。
+    return false;
+  }
+}
+
 export class ReActRuntime {
   private readonly runtime: Runtime;
   private readonly client: ResponsesClient;
@@ -200,11 +224,13 @@ export class ReActRuntime {
   async runTurn(
     userInput: string,
     output: (line: string) => void = console.log,
+    writeText: (text: string) => void = () => undefined,
   ): Promise<RuntimeTurn> {
     if (userInput.trim().length === 0) {
       return {
         input: userInput,
         reply: "请输入要处理的内容。",
+        streamed: false,
       };
     }
 
@@ -219,13 +245,17 @@ export class ReActRuntime {
 
       for (let step = 0; step < this.runtime.maxSteps; step += 1) {
         const stepLabel = `[Step ${step + 1}/${this.runtime.maxSteps}]`;
-        output(`${stepLabel} → 请求模型`);
+        emitSafely(output, `${stepLabel} → 请求模型`);
 
         const request = this.createRequest();
         let response: ModelResponse;
+        let responseTextWasWritten = false;
         try {
-          response = await this.client.responses.create(
-            sanitizeUnicode(request) as ResponsesRequest,
+          response = await this.requestModel(
+            request,
+            (delta) => {
+              if (emitSafely(writeText, delta)) responseTextWasWritten = true;
+            },
           );
         } catch (error) {
           throw requestFailure(error);
@@ -250,17 +280,27 @@ export class ReActRuntime {
           const refusal = refusalText(response.output);
           if (refusal !== undefined) throw new Error(`模型拒绝请求: ${refusal}`);
           if (response.output_text.length === 0) throw new Error("模型响应没有文本输出");
-          output(`${stepLabel} ← 最终回答`);
+          emitSafely(output, `${stepLabel} ← 最终回答`);
           if (turnId !== undefined) await this.recorder?.completeTurn(turnId);
           await this.compactContextIfNeeded(largestInputTokenCount, output);
-          return { input: userInput, reply: response.output_text };
+          return {
+            input: userInput,
+            reply: response.output_text,
+            streamed: responseTextWasWritten,
+          };
         }
 
-        output(`${stepLabel} ← 工具调用，共 ${functionCalls.length} 个`);
+        emitSafely(
+          output,
+          `${stepLabel} ← 工具调用，共 ${functionCalls.length} 个`,
+        );
         for (const [index, call] of functionCalls.entries()) {
-          output(`  [Tool ${index + 1}/${functionCalls.length}] ${call.name}`);
+          emitSafely(
+            output,
+            `  [Tool ${index + 1}/${functionCalls.length}] ${call.name}`,
+          );
           const observation = await this.tools.execute(call.name, call.arguments);
-          output(
+          emitSafely(output,
             `  [Tool ${index + 1}/${functionCalls.length}] Observation: ${observation}`,
           );
           await this.appendItems(turnId, [{
@@ -288,6 +328,7 @@ export class ReActRuntime {
       input: [...this.inputItems],
       store: false,
       include: ["reasoning.encrypted_content"],
+      stream: this.runtime.streaming,
     };
 
     if (this.tools.specs.length > 0) {
@@ -295,6 +336,41 @@ export class ReActRuntime {
       request.tool_choice = "auto";
     }
     return request;
+  }
+
+  private async requestModel(
+    request: ResponsesRequest,
+    onTextDelta: (delta: string) => void,
+  ): Promise<ModelResponse> {
+    const result = await this.client.responses.create(
+      sanitizeUnicode(request) as ResponsesRequest,
+    );
+    if (!isEventStream(result)) return result;
+
+    let terminalResponse: ModelResponse | undefined;
+    for await (const event of result) {
+      if (event.type === "response.output_text.delta") {
+        if (typeof event.delta === "string") onTextDelta(event.delta);
+      } else if (event.type === "error") {
+        const code = typeof event.code === "string" ? ` (${event.code})` : "";
+        const message = typeof event.message === "string"
+          ? event.message
+          : "无详细信息";
+        throw new Error(`流式响应失败${code}: ${message}`);
+      } else if (
+        event.type === "response.completed" ||
+        event.type === "response.failed" ||
+        event.type === "response.incomplete"
+      ) {
+        if (event.response !== null && typeof event.response === "object") {
+          terminalResponse = event.response as ModelResponse;
+        }
+      }
+    }
+    if (terminalResponse === undefined) {
+      throw new Error("流式响应结束但未收到终态事件");
+    }
+    return terminalResponse;
   }
 
   private async appendItems(
@@ -350,8 +426,8 @@ export class ReActRuntime {
       const summaryInput = candidate.previousSummary === undefined
         ? candidate.items
         : [compactionItem(candidate.previousSummary), ...candidate.items];
-      const response = await this.client.responses.create(
-        sanitizeUnicode({
+      const response = await this.requestModel(
+        {
           model: this.model,
           instructions:
             "请将以下较早的编码会话压缩为准确、可继续执行的中文摘要。" +
@@ -360,7 +436,9 @@ export class ReActRuntime {
           input: summaryInput,
           store: false,
           include: ["reasoning.encrypted_content"],
-        }) as ResponsesRequest,
+          stream: false,
+        },
+        () => undefined,
       );
       if (response.status !== "completed") {
         throw new Error(responseErrorMessage(response));
@@ -379,13 +457,9 @@ export class ReActRuntime {
         ...candidate.recentItems,
       );
     } catch (error) {
-      try {
-        output(`上下文压缩失败，继续保留完整历史: ${
-          error instanceof Error ? error.message : error
-        }`);
-      } catch {
-        // 维护任务和告警输出都不能破坏已经完成的用户 Turn。
-      }
+      emitSafely(output, `上下文压缩失败，继续保留完整历史: ${
+        error instanceof Error ? error.message : error
+      }`);
     }
   }
 }

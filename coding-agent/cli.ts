@@ -176,8 +176,24 @@ export async function runCli(): Promise<void> {
     await runInteractiveSession({
       ask: () => terminal.question("请输入任务（输入 exit 退出）: "),
       handleInput: async (input) => {
-        const turn = await (await requireAgent()).runTurn(input);
-        console.log(turn.reply);
+        let textLineOpen = false;
+        const turn = await (await requireAgent()).runTurn(
+          input,
+          (line) => {
+            if (textLineOpen) stdout.write("\n");
+            textLineOpen = false;
+            console.log(line);
+          },
+          (text) => {
+            stdout.write(text);
+            textLineOpen = true;
+          },
+        );
+        if (textLineOpen) {
+          stdout.write("\n");
+        } else if (!turn.streamed) {
+          console.log(turn.reply);
+        }
       },
       handleCommand: async (command) => {
         if (command.type === "help") {

@@ -50,6 +50,39 @@ workspace_mount = "/agent-workspace"
     triggerRatio: 0.8,
     keepRecentTurns: 2,
   });
+  assert.equal(runtime.streaming, true);
+});
+
+test("loadRuntime 校验流式输出配置", async () => {
+  const root = await configFixture(`
+[sandbox.windows]
+wsl_distribution = "Ubuntu"
+workspace_mount = "/workspace"
+`);
+  const settingsPath = path.join(root, "config", "settings.toml");
+  const settings = await readFile(settingsPath, "utf8");
+  await writeFile(
+    settingsPath,
+    settings.replace("max_steps = 2", 'max_steps = 2\nstreaming = "yes"'),
+  );
+
+  await assert.rejects(() => loadRuntime(root), /streaming 必须是布尔值/);
+});
+
+test("loadRuntime 支持显式关闭流式输出", async () => {
+  const root = await configFixture(`
+[sandbox.windows]
+wsl_distribution = "Ubuntu"
+workspace_mount = "/workspace"
+`);
+  const settingsPath = path.join(root, "config", "settings.toml");
+  const settings = await readFile(settingsPath, "utf8");
+  await writeFile(
+    settingsPath,
+    settings.replace("max_steps = 2", "max_steps = 2\nstreaming = false"),
+  );
+
+  assert.equal((await loadRuntime(root)).streaming, false);
 });
 
 test("loadRuntime 拒绝覆盖系统目录的 WSL 工作区挂载点", async () => {

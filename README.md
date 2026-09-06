@@ -6,6 +6,7 @@
 
 - 多步 ReAct：模型可以连续调用工具，并根据 Observation 决定下一步。
 - Responses Items：完整保留消息、推理项和函数调用上下文，函数结果通过 `call_id` 关联。
+- 流式输出：实时显示 Responses API 文本增量，并从终态事件还原完整 Items 后再进入会话历史。
 - 本地上下文：显式使用 `store: false`，由客户端重放完整 Items，不依赖远端会话持久化。
 - Provider 配置：支持配置实现 Responses API 的模型服务。
 - 工具注册：从 JSON 配置加载工具声明、本地 Handler 和参数 Schema。
@@ -56,6 +57,7 @@ active_provider = "openai"
 [agent]
 prompt = "react"
 max_steps = 10
+streaming = true
 compaction_trigger_ratio = 0.8
 compaction_keep_recent_turns = 2
 
@@ -69,6 +71,8 @@ context_window = 400000
 `config/settings.toml` 是本地敏感配置，不应提交到版本库。仓库仅提供不含密钥的 `settings.example.toml`。
 
 配置的 Provider、`base_url` 和模型必须支持 `/responses`。项目不会静默回退到旧协议，接口不兼容时会返回明确错误。
+
+`streaming` 默认为 `true`，普通模型调用通过 SSE 实时输出文本。若兼容的第三方 Provider 已实现 `/responses` 但不支持流式事件，可将其设为 `false`，运行时会使用非流式响应；上下文压缩固定使用非流式请求。无论采用哪种模式，只有终态 Response 中的完整 Items 会写入会话，文本增量不会单独持久化。
 
 会话状态默认保存在用户目录的 `.coding-agent/state.sqlite`。数据库包含原始提问、模型输出和工具结果；CLI 在首次实际任务前显示隐私提示。启动同一工作区时，仅当模型和系统 Prompt 的 SHA-256 指纹均一致才会恢复最近会话，否则会创建隔离的新 Session。输入 `exit` 或 `quit` 可退出交互循环。
 
@@ -157,9 +161,21 @@ coding-agent/
 
 ## 开发状态
 
-当前版本已完成 Responses API ReAct 工具链、权限模型、文件安全、Windows 沙箱框架、Runtime 会话记录接口、CLI 多轮会话管理和自动上下文压缩。后续将继续完善流式输出与长任务执行能力。
+当前版本已完成 Responses API ReAct 工具链与流式输出、权限模型、文件安全、Windows 沙箱框架、Runtime 会话记录接口、CLI 多轮会话管理和自动上下文压缩。后续将继续完善长任务执行能力。
 
 ## 更新记录
+
+### 2026-09-06
+
+- feat | 为普通 Responses API 模型调用增加 SSE 流式输出，CLI 在事件到达时直接写出 `response.output_text.delta`，减少长回复的首字等待时间。
+- Runtime 新增统一响应聚合入口，同时接受非流式 Response 和异步事件流；流式请求只将文本增量交给显示层，并以 `response.completed / failed / incomplete` 携带的终态 Response 作为协议事实。
+- 完整终态 Response 继续沿用既有状态校验、拒绝识别、token 用量统计、工具调用和 Items 重放逻辑；数据库仅保存完整 canonical Items，不保存不可恢复的局部 delta。
+- 保持 ReAct 工具循环语义：流式响应中的 reasoning 与 function_call 从终态 Items 统一提取，工具结果仍按 `call_id` 关联并依次追加，下一步请求可完整重放上下文。
+- 新增 `agent.streaming` 布尔配置并默认开启；可显式设为 `false` 兼容支持 `/responses` 但不支持 SSE 的第三方 Provider，非流式路径保留原有行为。
+- 上下文压缩固定使用 `stream: false`，避免维护性摘要出现在用户输出中，同时继续保持无工具、`store: false` 和失败降级策略。
+- 流式连接异常、错误事件或缺少终态事件均按失败 Turn 处理并回滚本轮内存上下文；已收到的局部文本不会写入数据库或污染下一轮请求。
+- 终端行输出与文本增量回调均经过故障隔离，显示层异常不会覆盖有效模型结果、破坏工具执行或改变持久化生命周期。
+- 补充流式文本聚合、完整 Items 持久化、工具调用接续、缺少终态回滚、输出回调异常、配置默认值和显式关闭测试。
 
 ### 2026-09-05
 

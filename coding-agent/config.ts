@@ -37,6 +37,7 @@ export type Runtime = {
   provider: Provider;
   prompt: string;
   maxSteps: number;
+  streaming: boolean;
   compaction: {
     triggerRatio: number;
     keepRecentTurns: number;
@@ -110,6 +111,9 @@ export async function loadRuntime(root = BASE_DIR): Promise<Runtime> {
   const maxSteps = agentConfig.max_steps ?? 10;
   if (!Number.isInteger(maxSteps) || Number(maxSteps) < 1)
     throw new Error("max_steps 必须是正整数");
+  const streaming = agentConfig.streaming ?? true;
+  if (typeof streaming !== "boolean")
+    throw new Error("streaming 必须是布尔值");
   const compactionTriggerRatio = agentConfig.compaction_trigger_ratio ?? 0.8;
   if (
     typeof compactionTriggerRatio !== "number" ||
@@ -174,6 +178,7 @@ export async function loadRuntime(root = BASE_DIR): Promise<Runtime> {
     },
     prompt,
     maxSteps: Number(maxSteps),
+    streaming,
     compaction: {
       triggerRatio: compactionTriggerRatio,
       keepRecentTurns: Number(compactionKeepRecentTurns),

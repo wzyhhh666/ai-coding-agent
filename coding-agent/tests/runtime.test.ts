@@ -20,6 +20,7 @@ const runtimeConfig: Runtime = {
   },
   prompt: "test prompt",
   maxSteps: 3,
+  streaming: false,
   compaction: { triggerRatio: 0.8, keepRecentTurns: 2 },
   sandbox: { mode: "auto", backend: "auto", allowSoftFallback: true },
 };
@@ -52,6 +53,12 @@ function message(text: string): Record<string, unknown> {
 
 function emptyTools(): ToolRegistry {
   return new ToolRegistry([], {});
+}
+
+async function* streamEvents(
+  events: Array<Record<string, unknown> & { type: string }>,
+) {
+  for (const event of events) yield event;
 }
 
 type RecorderEvent = {
@@ -144,6 +151,7 @@ test("ReActRuntime 使用 Responses Items 执行多个工具并完整重放上�
   assert.equal(requests.length, 2);
   assert.equal(requests[0]?.instructions, "test prompt");
   assert.equal(requests[0]?.store, false);
+  assert.equal(requests[0]?.stream, false);
   assert.deepEqual(requests[0]?.include, ["reasoning.encrypted_content"]);
   assert.deepEqual(requests[0]?.tools, [{
     type: "function",
@@ -169,6 +177,146 @@ test("ReActRuntime 使用 Responses Items 执行多个工具并完整重放上�
     { type: "function_call_output", call_id: "call-1", output: "hello" },
     { type: "function_call_output", call_id: "call-2", output: "world" },
   ]);
+});
+
+test("ReActRuntime 聚合流式事件并持久化完整终态 Items", async () => {
+  const requests: ResponsesRequest[] = [];
+  const recorderEvents: RecorderEvent[] = [];
+  const deltas: string[] = [];
+  const reasoning = { type: "reasoning", encrypted_content: "encrypted" };
+  const functionCall = {
+    type: "function_call",
+    call_id: "call-stream",
+    name: "echo",
+    arguments: '{"text":"hello"}',
+  };
+  const finalMessage = message("流式完成");
+  const client: ResponsesClient = {
+    responses: {
+      async create(request) {
+        requests.push(request);
+        const finalResponse = requests.length === 1
+          ? response([reasoning, functionCall], "", 120)
+          : response([finalMessage], "流式完成", 180);
+        const events = requests.length === 1
+          ? [{ type: "response.completed", response: finalResponse }]
+          : [
+            { type: "response.output_text.delta", delta: "流式" },
+            { type: "response.output_text.delta", delta: "完成" },
+            { type: "response.completed", response: finalResponse },
+          ];
+        return streamEvents(events);
+      },
+    },
+  };
+  const tools = new ToolRegistry(
+    [{
+      type: "function",
+      function: {
+        name: "echo",
+        parameters: { type: "object", properties: {}, additionalProperties: true },
+      },
+    }],
+    { echo: ({ text }) => String(text) },
+  );
+  const runtime = new ReActRuntime(
+    client,
+    "test-model",
+    "test prompt",
+    { ...runtimeConfig, streaming: true },
+    tools,
+    { recorder: recordingSession(recorderEvents) },
+  );
+
+  const result = await runtime.runTurn(
+    "work",
+    () => undefined,
+    (delta) => deltas.push(delta),
+  );
+
+  assert.deepEqual(deltas, ["流式", "完成"]);
+  assert.deepEqual(result, { input: "work", reply: "流式完成", streamed: true });
+  assert.equal(requests.every((request) => request.stream === true), true);
+  assert.deepEqual(
+    recorderEvents
+      .filter((event) => event.operation === "append")
+      .map((event) => event.value),
+    [
+      reasoning,
+      functionCall,
+      { type: "function_call_output", call_id: "call-stream", output: "hello" },
+      finalMessage,
+    ],
+  );
+});
+
+test("ReActRuntime 流缺少终态事件时回滚本轮上下文", async () => {
+  const requests: ResponsesRequest[] = [];
+  const events: RecorderEvent[] = [];
+  const client: ResponsesClient = {
+    responses: {
+      async create(request) {
+        requests.push(request);
+        if (requests.length === 1) {
+          return streamEvents([
+            { type: "response.output_text.delta", delta: "partial" },
+          ]);
+        }
+        return response([message("recovered")], "recovered");
+      },
+    },
+  };
+  const runtime = new ReActRuntime(
+    client,
+    "test-model",
+    "test prompt",
+    { ...runtimeConfig, streaming: true },
+    emptyTools(),
+    { recorder: recordingSession(events) },
+  );
+
+  await assert.rejects(runtime.runTurn("broken"), /未收到终态事件/);
+  await runtime.runTurn("next");
+
+  assert.deepEqual(requests[1]?.input, [{ role: "user", content: "next" }]);
+  assert.deepEqual(
+    events.map((event) => event.operation),
+    ["start", "fail", "start", "append", "complete"],
+  );
+});
+
+test("ReActRuntime 忽略流式文本输出回调异常", async () => {
+  const finalResponse = response([message("done")], "done");
+  const client: ResponsesClient = {
+    responses: {
+      async create() {
+        return streamEvents([
+          { type: "response.output_text.delta", delta: "done" },
+          { type: "response.completed", response: finalResponse },
+        ]);
+      },
+    },
+  };
+  const runtime = new ReActRuntime(
+    client,
+    "test-model",
+    "test prompt",
+    { ...runtimeConfig, streaming: true },
+    emptyTools(),
+  );
+
+  const result = await runtime.runTurn(
+    "work",
+    () => {
+      throw new Error("line output unavailable");
+    },
+    () => {
+      throw new Error("text output unavailable");
+    },
+  );
+
+  assert.equal(result.reply, "done");
+  assert.equal(result.streamed, false);
 });
 
 test("ReActRuntime 无工具时不发送工具字段并保留多轮历史", async () => {
@@ -675,6 +823,7 @@ test("ReActRuntime 超过 token 阈值后压缩旧 Turn 并替换内存上下文
 
   assert.deepEqual(saved, [{ summary: "summary", through: 2 }]);
   assert.equal("tools" in requests[1]!, false);
+  assert.equal(requests[1]?.stream, false);
   assert.deepEqual(requests[2]?.input.slice(0, 3), [
     compactionItem("summary"),
     { role: "assistant", content: "recent" },
