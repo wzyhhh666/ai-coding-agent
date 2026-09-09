@@ -46,6 +46,17 @@ export type ReActRuntimeOptions = {
   initialItems?: ResponseInputItem[];
 };
 
+export type RunTurnOptions = {
+  signal?: AbortSignal;
+};
+
+export class TurnCancelledError extends Error {
+  constructor() {
+    super("任务已取消");
+    this.name = "TurnCancelledError";
+  }
+}
+
 type ResponseStatus =
   | "queued"
   | "in_progress"
@@ -92,6 +103,7 @@ export type ResponsesClient = {
   responses: {
     create(
       request: ResponsesRequest,
+      options?: { signal?: AbortSignal },
     ): Promise<ModelResponse | ResponseEventStream>;
   };
 };
@@ -172,6 +184,17 @@ function requestFailure(error: unknown): Error {
   );
 }
 
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new TurnCancelledError();
+}
+
+function preserveCancellation(error: unknown, signal?: AbortSignal): Error {
+  if (error instanceof TurnCancelledError || signal?.aborted) {
+    return error instanceof TurnCancelledError ? error : new TurnCancelledError();
+  }
+  return requestFailure(error);
+}
+
 function inputTokenCount(response: ModelResponse): number | undefined {
   const value = response.usage?.input_tokens;
   return typeof value === "number" && Number.isFinite(value) && value >= 0
@@ -225,6 +248,7 @@ export class ReActRuntime {
     userInput: string,
     output: (line: string) => void = console.log,
     writeText: (text: string) => void = () => undefined,
+    options: RunTurnOptions = {},
   ): Promise<RuntimeTurn> {
     if (userInput.trim().length === 0) {
       return {
@@ -239,11 +263,13 @@ export class ReActRuntime {
     this.tools.beginTurn();
 
     try {
+      throwIfAborted(options.signal);
       turnId = await this.recorder?.startTurn(userInput);
       this.inputItems.push({ role: "user", content: userInput });
       let largestInputTokenCount = 0;
 
       for (let step = 0; step < this.runtime.maxSteps; step += 1) {
+        throwIfAborted(options.signal);
         const stepLabel = `[Step ${step + 1}/${this.runtime.maxSteps}]`;
         emitSafely(output, `${stepLabel} → 请求模型`);
 
@@ -256,9 +282,10 @@ export class ReActRuntime {
             (delta) => {
               if (emitSafely(writeText, delta)) responseTextWasWritten = true;
             },
+            options.signal,
           );
         } catch (error) {
-          throw requestFailure(error);
+          throw preserveCancellation(error, options.signal);
         }
 
         if (response.status !== "completed") {
@@ -300,6 +327,7 @@ export class ReActRuntime {
             `  [Tool ${index + 1}/${functionCalls.length}] ${call.name}`,
           );
           const observation = await this.tools.execute(call.name, call.arguments);
+          throwIfAborted(options.signal);
           emitSafely(output,
             `  [Tool ${index + 1}/${functionCalls.length}] Observation: ${observation}`,
           );
@@ -341,14 +369,17 @@ export class ReActRuntime {
   private async requestModel(
     request: ResponsesRequest,
     onTextDelta: (delta: string) => void,
+    signal?: AbortSignal,
   ): Promise<ModelResponse> {
     const result = await this.client.responses.create(
       sanitizeUnicode(request) as ResponsesRequest,
+      { signal },
     );
     if (!isEventStream(result)) return result;
 
     let terminalResponse: ModelResponse | undefined;
     for await (const event of result) {
+      throwIfAborted(signal);
       if (event.type === "response.output_text.delta") {
         if (typeof event.delta === "string") onTextDelta(event.delta);
       } else if (event.type === "error") {
@@ -439,6 +470,7 @@ export class ReActRuntime {
           stream: false,
         },
         () => undefined,
+        undefined,
       );
       if (response.status !== "completed") {
         throw new Error(responseErrorMessage(response));

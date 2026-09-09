@@ -8,6 +8,7 @@ import {
   type ResponsesClient,
   type ResponsesRequest,
   type SessionRecorder,
+  TurnCancelledError,
 } from "../runtime.ts";
 import { ToolRegistry } from "../tools/registry.ts";
 
@@ -283,6 +284,69 @@ test("ReActRuntime 流缺少终态事件时回滚本轮上下文", async () => {
     events.map((event) => event.operation),
     ["start", "fail", "start", "append", "complete"],
   );
+});
+
+test("ReActRuntime 请求前取消不会创建 Turn 并保留后续上下文", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  const events: RecorderEvent[] = [];
+  let requestCount = 0;
+  const client: ResponsesClient = {
+    responses: { async create() {
+      requestCount += 1;
+      return response([message("unexpected")], "unexpected");
+    } },
+  };
+  const runtime = new ReActRuntime(
+    client,
+    "test-model",
+    "test prompt",
+    runtimeConfig,
+    emptyTools(),
+    { recorder: recordingSession(events) },
+  );
+
+  await assert.rejects(
+    runtime.runTurn("cancelled", () => undefined, () => undefined, {
+      signal: controller.signal,
+    }),
+    (error) => error instanceof TurnCancelledError,
+  );
+  assert.equal(requestCount, 0);
+  assert.deepEqual(events, []);
+});
+
+test("ReActRuntime 流式请求取消时回滚局部响应并透传取消错误", async () => {
+  const controller = new AbortController();
+  const requests: ResponsesRequest[] = [];
+  const events: RecorderEvent[] = [];
+  const client: ResponsesClient = {
+    responses: { async create(request) {
+      requests.push(request);
+      return (async function* () {
+        yield { type: "response.output_text.delta", delta: "partial" };
+        controller.abort();
+        yield { type: "response.output_text.delta", delta: "ignored" };
+      })();
+    } },
+  };
+  const runtime = new ReActRuntime(
+    client,
+    "test-model",
+    "test prompt",
+    { ...runtimeConfig, streaming: true },
+    emptyTools(),
+    { recorder: recordingSession(events) },
+  );
+
+  await assert.rejects(
+    runtime.runTurn("cancelled", () => undefined, () => undefined, {
+      signal: controller.signal,
+    }),
+    (error) => error instanceof TurnCancelledError,
+  );
+  assert.equal(requests[0]?.stream, true);
+  assert.deepEqual(events.map((event) => event.operation), ["start", "fail"]);
 });
 
 test("ReActRuntime 忽略流式文本输出回调异常", async () => {
