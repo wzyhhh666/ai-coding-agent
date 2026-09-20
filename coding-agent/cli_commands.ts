@@ -5,6 +5,9 @@ export type CliInput =
   | { type: "help" }
   | { type: "list-sessions" }
   | { type: "new-session"; title?: string }
+  | { type: "resume-session"; sessionId?: string }
+  | { type: "continue-turn"; turnId: string }
+  | { type: "retry-turn"; turnId: string }
   | { type: "switch-session"; sessionId: string }
   | { type: "invalid"; message: string };
 
@@ -42,6 +45,23 @@ export function parseCliInput(value: string): CliInput {
     return argument.length === 0
       ? { type: "new-session" }
       : { type: "new-session", title: argument };
+  }
+  if (command === "/resume") {
+    return argument.length === 0
+      ? { type: "resume-session" }
+      : /\s/.test(argument)
+      ? { type: "invalid", message: "用法: /resume [session-id]" }
+      : { type: "resume-session", sessionId: argument };
+  }
+  if (command === "/continue") {
+    return argument.length === 0 || /\s/.test(argument)
+      ? { type: "invalid", message: "用法: /continue <turn-id>" }
+      : { type: "continue-turn", turnId: argument };
+  }
+  if (command === "/retry") {
+    return argument.length === 0 || /\s/.test(argument)
+      ? { type: "invalid", message: "用法: /retry <turn-id>" }
+      : { type: "retry-turn", turnId: argument };
   }
   if (command === "/switch") {
     return argument.length === 0 || /\s/.test(argument)

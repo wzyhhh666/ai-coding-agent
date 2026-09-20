@@ -131,6 +131,10 @@ export class ToolRegistry {
     return this.fileChanges.finishTurn();
   }
 
+  workspaceFingerprint(): string | undefined {
+    return this.fileChanges.workspaceFingerprint();
+  }
+
   async execute(name: string, rawArguments: string): Promise<string> {
     const handler = this.handlers[name];
     if (!handler) return `未注册工具: ${name}`;

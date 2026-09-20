@@ -63,8 +63,9 @@ async function* streamEvents(
 }
 
 type RecorderEvent = {
-  operation: "start" | "append" | "complete" | "fail";
+  operation: "start" | "append" | "complete" | "fail" | "interrupt";
   value?: unknown;
+  reason?: string;
 };
 
 function recordingSession(events: RecorderEvent[]): SessionRecorder {
@@ -79,8 +80,11 @@ function recordingSession(events: RecorderEvent[]): SessionRecorder {
     async completeTurn(turnId) {
       events.push({ operation: "complete", value: turnId });
     },
-    async failTurn(_turnId, error) {
-      events.push({ operation: "fail", value: error });
+    async failTurn(_turnId, error, reason) {
+      events.push({ operation: "fail", value: error, reason });
+    },
+    async interruptTurn(turnId, reason) {
+      events.push({ operation: "interrupt", value: turnId, reason });
     },
   };
 }
@@ -279,11 +283,62 @@ test("ReActRuntime 流缺少终态事件时回滚本轮上下文", async () => {
   await assert.rejects(runtime.runTurn("broken"), /未收到终态事件/);
   await runtime.runTurn("next");
 
-  assert.deepEqual(requests[1]?.input, [{ role: "user", content: "next" }]);
+  assert.deepEqual(requests[1]?.input, [
+    { type: "message", role: "user", content: "broken" },
+    { type: "message", role: "user", content: "next" },
+  ]);
   assert.deepEqual(
     events.map((event) => event.operation),
     ["start", "fail", "start", "append", "complete"],
   );
+  assert.equal(events[1]?.reason, "protocol_error");
+});
+
+test("ReActRuntime 后续 Turn 自动保留已完成工具结果并过滤未完成调用", async () => {
+  const requests: ResponsesRequest[] = [];
+  const functionCall = {
+    type: "function_call",
+    call_id: "call-1",
+    name: "echo",
+    arguments: '{"text":"hello"}',
+  };
+  const client: ResponsesClient = {
+    responses: {
+      async create(request) {
+        requests.push(request);
+        if (requests.length === 1) return response([functionCall]);
+        if (requests.length === 2) throw new Error("provider down");
+        return response([message("已继续")], "已继续");
+      },
+    },
+  };
+  const tools = new ToolRegistry(
+    [{
+      type: "function",
+      function: {
+        name: "echo",
+        parameters: { type: "object", properties: { text: { type: "string" } } },
+      },
+    }],
+    { echo: ({ text }) => String(text) },
+  );
+  const runtime = new ReActRuntime(
+    client,
+    "test-model",
+    "test prompt",
+    runtimeConfig,
+    tools,
+  );
+
+  await assert.rejects(runtime.runTurn("first"), /provider down/);
+  await runtime.runTurn("second", () => undefined);
+
+  assert.deepEqual(requests[2]?.input, [
+    { type: "message", role: "user", content: "first" },
+    functionCall,
+    { type: "function_call_output", call_id: "call-1", output: "hello" },
+    { type: "message", role: "user", content: "second" },
+  ]);
 });
 
 test("ReActRuntime 请求前取消不会创建 Turn 并保留后续上下文", async () => {
@@ -346,7 +401,107 @@ test("ReActRuntime 流式请求取消时回滚局部响应并透传取消错误"
     (error) => error instanceof TurnCancelledError,
   );
   assert.equal(requests[0]?.stream, true);
-  assert.deepEqual(events.map((event) => event.operation), ["start", "fail"]);
+  assert.equal(requests.length, 1);
+  assert.deepEqual(events, [
+    { operation: "start", value: "cancelled" },
+    { operation: "interrupt", value: "turn-1", reason: "user_cancelled" },
+  ]);
+});
+
+test("ReActRuntime 已收到完整终态时以终态事实优先于竞态取消", async () => {
+  const controller = new AbortController();
+  const events: RecorderEvent[] = [];
+  const finalResponse = response([message("done")], "done");
+  const client: ResponsesClient = {
+    responses: { async create() {
+      return (async function* () {
+        yield { type: "response.completed", response: finalResponse };
+        controller.abort();
+      })();
+    } },
+  };
+  const runtime = new ReActRuntime(
+    client,
+    "test-model",
+    "test prompt",
+    { ...runtimeConfig, streaming: true },
+    emptyTools(),
+    { recorder: recordingSession(events) },
+  );
+
+  const result = await runtime.runTurn(
+    "finish",
+    () => undefined,
+    () => undefined,
+    { signal: controller.signal },
+  );
+
+  assert.equal(result.reply, "done");
+  assert.deepEqual(events, [
+    { operation: "start", value: "finish" },
+    { operation: "append", value: message("done") },
+    { operation: "complete", value: "turn-1" },
+  ]);
+});
+
+test("ReActRuntime 工具完成后先持久化结果再结束取消", async () => {
+  const controller = new AbortController();
+  const events: RecorderEvent[] = [];
+  const functionCall = {
+    type: "function_call",
+    call_id: "call-1",
+    name: "write_result",
+    arguments: "{}",
+  };
+  const client: ResponsesClient = {
+    responses: { async create() {
+      return response([functionCall]);
+    } },
+  };
+  const tools = new ToolRegistry(
+    [{
+      type: "function",
+      function: {
+        name: "write_result",
+        parameters: { type: "object", properties: {} },
+      },
+    }],
+    {
+      write_result: () => {
+        controller.abort();
+        return "written";
+      },
+    },
+  );
+  const runtime = new ReActRuntime(
+    client,
+    "test-model",
+    "test prompt",
+    runtimeConfig,
+    tools,
+    { recorder: recordingSession(events) },
+  );
+
+  await assert.rejects(
+    runtime.runTurn("write", () => undefined, () => undefined, {
+      signal: controller.signal,
+    }),
+    (error) => error instanceof TurnCancelledError,
+  );
+
+  assert.deepEqual(events, [
+    { operation: "start", value: "write" },
+    { operation: "append", value: functionCall },
+    {
+      operation: "append",
+      value: {
+        type: "function_call_output",
+        call_id: "call-1",
+        output: "written",
+      },
+    },
+    { operation: "interrupt", value: "turn-1", reason: "user_cancelled" },
+  ]);
 });
 
 test("ReActRuntime 忽略流式文本输出回调异常", async () => {
@@ -443,24 +598,29 @@ test("ReActRuntime 区分 incomplete、failed 和非终态响应", async (contex
       status: "incomplete" as const,
       incomplete_details: { reason: "max_output_tokens" },
       expected: /模型响应不完整.*max_output_tokens/,
+      expectedReason: "model_incomplete",
     },
     {
       status: "failed" as const,
       error: { code: "server_error", message: "broken" },
       expected: /模型响应失败 \(server_error\): broken/,
+      expectedReason: "provider_error",
     },
     {
       status: "queued" as const,
       expected: /同步模型请求返回了非终态: queued/,
+      expectedReason: "protocol_error",
     },
     {
       status: "cancelled" as const,
       expected: /模型响应已取消/,
+      expectedReason: "provider_cancelled",
     },
   ];
 
   for (const item of cases) {
     await context.test(item.status, async () => {
+      const events: RecorderEvent[] = [];
       const client = {
         responses: {
           async create() {
@@ -483,9 +643,44 @@ test("ReActRuntime 区分 incomplete、failed 和非终态响应", async (contex
         "test prompt",
         runtimeConfig,
         emptyTools(),
+        { recorder: recordingSession(events) },
       );
 
       await assert.rejects(runtime.runTurn("test", () => undefined), item.expected);
+      assert.equal(events[1]?.operation, "fail");
+      assert.equal(events[1]?.reason, item.expectedReason);
+    });
+  }
+});
+
+test("ReActRuntime 区分网络超时和网络连接失败", async (context) => {
+  const cases = [
+    { name: "APIConnectionTimeoutError", reason: "network_timeout" },
+    { name: "APIConnectionError", reason: "network_error" },
+  ];
+
+  for (const item of cases) {
+    await context.test(item.reason, async () => {
+      const events: RecorderEvent[] = [];
+      const requestError = new Error("request failed");
+      requestError.name = item.name;
+      const client: ResponsesClient = {
+        responses: { async create() {
+          throw requestError;
+        } },
+      };
+      const runtime = new ReActRuntime(
+        client,
+        "test-model",
+        "test prompt",
+        runtimeConfig,
+        emptyTools(),
+        { recorder: recordingSession(events) },
+      );
+
+      await assert.rejects(runtime.runTurn("test", () => undefined));
+      assert.equal(events[1]?.operation, "fail");
+      assert.equal(events[1]?.reason, item.reason);
     });
   }
 });
@@ -607,7 +802,7 @@ test("ReActRuntime 达到步骤上限时仍结束工具回合", async () => {
   );
 });
 
-test("ReActRuntime 失败 Turn 不会污染下一轮上下文", async () => {
+test("ReActRuntime 后续 Turn 会保留失败 Turn 的安全用户上下文", async () => {
   const requests: ResponsesRequest[] = [];
   const client: ResponsesClient = {
     responses: {
@@ -630,7 +825,10 @@ test("ReActRuntime 失败 Turn 不会污染下一轮上下文", async () => {
   const result = await runtime.runTurn("next turn", () => undefined);
 
   assert.equal(result.reply, "recovered");
-  assert.deepEqual(requests[1]?.input, [{ role: "user", content: "next turn" }]);
+  assert.deepEqual(requests[1]?.input, [
+    { type: "message", role: "user", content: "failed turn" },
+    { type: "message", role: "user", content: "next turn" },
+  ]);
 });
 
 test("ReActRuntime 成功回合按生命周期持久化完整输出", async () => {
@@ -712,6 +910,175 @@ test("ReActRuntime 按协议顺序持久化模型输出和工具结果", async (
   ]);
 });
 
+test("ReActRuntime 优先使用原子模型批次和工具结果检查点接口", async () => {
+  const events: Array<{ operation: string; value?: unknown; metadata?: unknown }> = [];
+  let requestCount = 0;
+  const functionCall = {
+    type: "function_call",
+    call_id: "call-atomic",
+    name: "echo",
+    arguments: '{"text":"hello"}',
+  };
+  const client: ResponsesClient = {
+    responses: { async create() {
+      requestCount += 1;
+      return requestCount === 1
+        ? response([functionCall])
+        : response([message("done")], "done");
+    } },
+  };
+  const tools = new ToolRegistry(
+    [{
+      type: "function",
+      function: {
+        name: "echo",
+        parameters: { type: "object", properties: { text: { type: "string" } } },
+      },
+    }],
+    { echo: ({ text }) => String(text) },
+  );
+  const recorder: SessionRecorder = {
+    async startTurn() {
+      events.push({ operation: "start" });
+      return "turn-atomic";
+    },
+    async appendItem() {
+      throw new Error("不应回退到逐 Item 接口");
+    },
+    async appendModelResponse(_turnId, items, metadata) {
+      events.push({ operation: "model_batch", value: items, metadata });
+    },
+    async appendToolResult(_turnId, item, metadata) {
+      events.push({ operation: "tool_result", value: item, metadata });
+    },
+    async completeTurn() {
+      events.push({ operation: "complete" });
+    },
+    async failTurn() {
+      throw new Error("不应失败");
+    },
+    async interruptTurn() {
+      throw new Error("不应中断");
+    },
+  };
+
+  const runtime = new ReActRuntime(
+    client,
+    "test-model",
+    "test prompt",
+    runtimeConfig,
+    tools,
+    { recorder },
+  );
+  await runtime.runTurn("work", () => undefined);
+
+  assert.deepEqual(events.map((event) => event.operation), [
+    "start",
+    "model_batch",
+    "tool_result",
+    "model_batch",
+    "complete",
+  ]);
+  assert.deepEqual(events[1]?.metadata, { responseId: "resp-test" });
+  assert.deepEqual(events[2]?.metadata, {
+    functionCallId: "call-atomic",
+    workspaceFingerprint: undefined,
+  });
+});
+
+test("ReActRuntime 终止后优先使用已落库检查点重建 follow_up 上下文", async () => {
+  const events: string[] = [];
+  const requests: ResponsesRequest[] = [];
+  let requestCount = 0;
+  const persistedItems = [
+    { type: "message", role: "user", content: "work" },
+    {
+      type: "function_call",
+      call_id: "call-persisted",
+      name: "echo",
+      arguments: '{"text":"saved"}',
+    },
+    {
+      type: "function_call_output",
+      call_id: "call-persisted",
+      output: "saved",
+    },
+  ];
+  const recorder: SessionRecorder = {
+    async startTurn() {
+      events.push("start");
+      return "turn-persisted";
+    },
+    async appendItem() {},
+    async appendModelResponse() {
+      events.push("model");
+    },
+    async appendToolResult() {
+      events.push("tool");
+    },
+    async completeTurn() {},
+    async failTurn() {
+      events.push("fail");
+    },
+    async interruptTurn() {
+      events.push("interrupt");
+    },
+    async buildTurnReplay() {
+      events.push("replay");
+      return {
+        items: persistedItems,
+        warnings: [],
+        includedTurnIds: ["turn-persisted"],
+      };
+    },
+  };
+  const client: ResponsesClient = {
+    responses: {
+      async create(request) {
+        requests.push(request);
+        requestCount += 1;
+        if (requestCount === 1) {
+          return response([{
+            type: "function_call",
+            call_id: "call-runtime",
+            name: "echo",
+            arguments: '{"text":"runtime"}',
+          }]);
+        }
+        return response([message("done")], "done");
+      },
+    },
+  };
+  const tools = new ToolRegistry(
+    [{
+      type: "function",
+      function: {
+        name: "echo",
+        parameters: { type: "object", properties: { text: { type: "string" } } },
+      },
+    }],
+    { echo: ({ text }) => String(text) },
+  );
+  const limitedRuntime = { ...runtimeConfig, maxSteps: 1 };
+  const runtime = new ReActRuntime(
+    client,
+    "test-model",
+    "test prompt",
+    limitedRuntime,
+    tools,
+    { recorder },
+  );
+
+  await assert.rejects(runtime.runTurn("work", () => undefined), /达到最大步骤数/);
+  assert.deepEqual(events, ["start", "model", "tool", "fail", "replay"]);
+
+  await runtime.runTurn("继续", () => undefined);
+  assert.deepEqual(requests[1]?.input, [
+    ...persistedItems,
+    { type: "message", role: "user", content: "继续" },
+  ]);
+});
+
 test("ReActRuntime 失败时标记 Turn 且不调用完成", async () => {
   const events: RecorderEvent[] = [];
   const modelError = new Error("model unavailable");
@@ -732,7 +1099,52 @@ test("ReActRuntime 失败时标记 Turn 且不调用完成", async () => {
   await assert.rejects(runtime.runTurn("work", () => undefined));
 
   assert.deepEqual(events.map((event) => event.operation), ["start", "fail"]);
+  assert.equal(events[1]?.reason, "provider_error");
   assert.match(String(events[1]?.value), /Responses API 请求失败/);
+});
+
+test("ReActRuntime 将未预期的工具执行链异常分类为 tool_error", async () => {
+  const events: RecorderEvent[] = [];
+  const functionCall = {
+    type: "function_call",
+    call_id: "call-1",
+    name: "broken_tool",
+    arguments: "{}",
+  };
+  const client: ResponsesClient = {
+    responses: { async create() {
+      return response([functionCall]);
+    } },
+  };
+  const tools = new ToolRegistry(
+    [{
+      type: "function",
+      function: {
+        name: "broken_tool",
+        parameters: { type: "object", properties: {} },
+      },
+    }],
+    { broken_tool: () => "unused" },
+  );
+  tools.execute = async () => {
+    throw new Error("tool infrastructure unavailable");
+  };
+  const runtime = new ReActRuntime(
+    client,
+    "test-model",
+    "test prompt",
+    runtimeConfig,
+    tools,
+    { recorder: recordingSession(events) },
+  );
+
+  await assert.rejects(
+    runtime.runTurn("work", () => undefined),
+    /工具执行链失败: tool infrastructure unavailable/,
+  );
+  assert.equal(events[1]?.operation, "append");
+  assert.equal(events[2]?.operation, "fail");
+  assert.equal(events[2]?.reason, "tool_error");
 });
 
 test("ReActRuntime 持久化 Item 失败时回滚上下文并标记失败", async () => {
@@ -766,8 +1178,16 @@ test("ReActRuntime 持久化 Item 失败时回滚上下文并标记失败", asyn
   await assert.rejects(runtime.runTurn("second", () => undefined));
 
   assert.equal(appendCount, 2);
-  assert.deepEqual(requests[1]?.input, [{ role: "user", content: "second" }]);
-  assert.equal(events.filter((event) => event.operation === "fail").length, 2);
+  assert.deepEqual(requests[1]?.input, [
+    { type: "message", role: "user", content: "first" },
+    { type: "message", role: "user", content: "second" },
+  ]);
+  const failures = events.filter((event) => event.operation === "fail");
+  assert.equal(failures.length, 2);
+  assert.deepEqual(
+    failures.map((event) => event.reason),
+    ["persistence_error", "persistence_error"],
+  );
 });
 
 test("ReActRuntime 不用失败记录错误覆盖原始运行错误", async () => {
@@ -820,7 +1240,7 @@ test("ReActRuntime 从防御性副本恢复上下文", async () => {
 
   assert.deepEqual(requests[0]?.input.slice(0, 2), [
     { role: "user", content: { text: "old" } },
-    { role: "user", content: "new" },
+    { type: "message", role: "user", content: "new" },
   ]);
 });
 
@@ -891,7 +1311,7 @@ test("ReActRuntime 超过 token 阈值后压缩旧 Turn 并替换内存上下文
   assert.deepEqual(requests[2]?.input.slice(0, 3), [
     compactionItem("summary"),
     { role: "assistant", content: "recent" },
-    { role: "user", content: "second" },
+    { type: "message", role: "user", content: "second" },
   ]);
 });
 

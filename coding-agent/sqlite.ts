@@ -1,9 +1,9 @@
-import { chmod, mkdir, open } from "node:fs/promises";
+import { chmod, copyFile, mkdir, open } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-export const CURRENT_SCHEMA_VERSION = 1;
+export const CURRENT_SCHEMA_VERSION = 3;
 export const STATE_DIRECTORY_MODE = 0o700;
 export const STATE_DATABASE_MODE = 0o600;
 
@@ -84,6 +84,185 @@ const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    version: 2,
+    sql: `
+      ALTER TABLE turns ADD COLUMN termination_reason TEXT
+        CHECK (
+          termination_reason IS NULL OR termination_reason IN (
+            'user_cancelled',
+            'process_exited',
+            'network_timeout',
+            'network_error',
+            'provider_error',
+            'provider_cancelled',
+            'protocol_error',
+            'tool_error',
+            'persistence_error',
+            'model_incomplete',
+            'model_refusal',
+            'step_limit',
+            'unknown'
+          )
+        );
+
+      UPDATE turns
+      SET termination_reason = CASE
+        WHEN status = 'failed' THEN 'unknown'
+        WHEN status = 'interrupted' THEN 'process_exited'
+        ELSE NULL
+      END;
+
+      CREATE TRIGGER turns_termination_insert_guard
+      BEFORE INSERT ON turns
+      WHEN COALESCE((
+        (NEW.status IN ('running', 'completed') AND NEW.termination_reason IS NULL)
+        OR
+        (NEW.status = 'interrupted'
+          AND NEW.termination_reason IN ('user_cancelled', 'process_exited'))
+        OR
+        (NEW.status = 'failed'
+          AND NEW.termination_reason IN (
+            'network_timeout',
+            'network_error',
+            'provider_error',
+            'provider_cancelled',
+            'protocol_error',
+            'tool_error',
+            'persistence_error',
+            'model_incomplete',
+            'model_refusal',
+            'step_limit',
+            'unknown'
+          ))
+      ), 0) = 0
+      BEGIN
+        SELECT RAISE(ABORT, 'Turn 状态与终止原因不匹配');
+      END;
+
+      CREATE TRIGGER turns_termination_update_guard
+      BEFORE UPDATE OF status, termination_reason ON turns
+      WHEN COALESCE((
+        (NEW.status IN ('running', 'completed') AND NEW.termination_reason IS NULL)
+        OR
+        (NEW.status = 'interrupted'
+          AND NEW.termination_reason IN ('user_cancelled', 'process_exited'))
+        OR
+        (NEW.status = 'failed'
+          AND NEW.termination_reason IN (
+            'network_timeout',
+            'network_error',
+            'provider_error',
+            'provider_cancelled',
+            'protocol_error',
+            'tool_error',
+            'persistence_error',
+            'model_incomplete',
+            'model_refusal',
+            'step_limit',
+            'unknown'
+          ))
+      ), 0) = 0
+      BEGIN
+        SELECT RAISE(ABORT, 'Turn 状态与终止原因不匹配');
+      END;
+
+      CREATE TRIGGER turns_terminal_update_guard
+      BEFORE UPDATE OF status, termination_reason ON turns
+      WHEN OLD.status <> 'running'
+      BEGIN
+        SELECT RAISE(ABORT, 'Turn 终态不可变');
+      END;
+
+      CREATE TRIGGER items_running_turn_insert_guard
+      BEFORE INSERT ON items
+      WHEN NOT EXISTS (
+        SELECT 1
+        FROM turns
+        WHERE id = NEW.turn_id
+          AND session_id = NEW.session_id
+          AND status = 'running'
+      )
+      BEGIN
+        SELECT RAISE(ABORT, '只能向运行中的 Turn 追加 Item');
+      END;
+    `,
+  },
+  {
+    version: 3,
+    sql: `
+      CREATE TABLE turn_checkpoints (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL,
+        kind TEXT NOT NULL
+          CHECK (kind IN ('model_response', 'tool_result')),
+        through_item_sequence INTEGER NOT NULL
+          CHECK (through_item_sequence >= 1),
+        response_id TEXT,
+        function_call_id TEXT,
+        workspace_fingerprint TEXT,
+        created_at INTEGER NOT NULL,
+        CHECK (
+          (kind = 'model_response' AND function_call_id IS NULL) OR
+          (kind = 'tool_result' AND function_call_id IS NOT NULL)
+        ),
+        CHECK (kind = 'model_response' OR response_id IS NULL),
+        FOREIGN KEY (session_id)
+          REFERENCES sessions(id)
+          ON DELETE CASCADE,
+        FOREIGN KEY (turn_id)
+          REFERENCES turns(id)
+          ON DELETE CASCADE,
+        UNIQUE (turn_id, sequence)
+      );
+
+      CREATE INDEX turn_checkpoints_turn_sequence_idx
+      ON turn_checkpoints(turn_id, sequence);
+
+      CREATE TRIGGER turn_checkpoints_running_turn_insert_guard
+      BEFORE INSERT ON turn_checkpoints
+      WHEN NOT EXISTS (
+        SELECT 1
+        FROM turns
+        WHERE id = NEW.turn_id
+          AND session_id = NEW.session_id
+          AND status = 'running'
+      )
+      BEGIN
+        SELECT RAISE(ABORT, '只能向运行中的 Turn 创建检查点');
+      END;
+
+      CREATE TRIGGER turn_checkpoints_item_reference_guard
+      BEFORE INSERT ON turn_checkpoints
+      WHEN NOT EXISTS (
+        SELECT 1
+        FROM items
+        WHERE session_id = NEW.session_id
+          AND turn_id = NEW.turn_id
+          AND sequence = NEW.through_item_sequence
+      )
+      BEGIN
+        SELECT RAISE(ABORT, '检查点必须引用同一 Turn 中已存在的 Item');
+      END;
+
+      CREATE TRIGGER turn_checkpoints_order_guard
+      BEFORE INSERT ON turn_checkpoints
+      WHEN EXISTS (
+        SELECT 1
+        FROM turn_checkpoints
+        WHERE turn_id = NEW.turn_id
+          AND (
+            sequence >= NEW.sequence OR
+            through_item_sequence >= NEW.through_item_sequence
+          )
+      )
+      BEGIN
+        SELECT RAISE(ABORT, '检查点序号必须严格递增');
+      END;
+    `,
+  },
 ];
 
 export function stateDatabasePath(): string {
@@ -122,6 +301,28 @@ function configureDatabase(database: DatabaseSync): void {
     PRAGMA journal_mode = WAL;
     PRAGMA busy_timeout = 5000;
   `);
+}
+
+function integrityCheck(database: DatabaseSync): void {
+  const result = database.prepare("PRAGMA integrity_check").get() as
+    | Record<string, unknown>
+    | undefined;
+  if (result?.integrity_check !== "ok") {
+    throw new Error(`状态数据库完整性检查失败: ${String(result?.integrity_check)}`);
+  }
+}
+
+async function backupBeforeMigration(
+  database: DatabaseSync,
+  databasePath: string,
+  version: number,
+): Promise<void> {
+  if (version < 1 || version >= CURRENT_SCHEMA_VERSION) return;
+  integrityCheck(database);
+  database.exec("PRAGMA wal_checkpoint(FULL)");
+  const backupPath = `${databasePath}.backup-v${version}`;
+  await copyFile(databasePath, backupPath);
+  await chmod(backupPath, STATE_DATABASE_MODE);
 }
 
 function migrateDatabase(database: DatabaseSync): void {
@@ -164,12 +365,47 @@ function tableColumns(database: DatabaseSync, table: string): Set<string> {
   );
 }
 
+function schemaObjectExists(
+  database: DatabaseSync,
+  type: "trigger",
+  name: string,
+): boolean {
+  return database.prepare(`
+    SELECT 1 AS found
+    FROM sqlite_master
+    WHERE type = ? AND name = ?
+  `).get(type, name) !== undefined;
+}
+
 function validateCurrentSchema(database: DatabaseSync): void {
   const sessionColumns = tableColumns(database, "sessions");
+  const turnColumns = tableColumns(database, "turns");
   const itemColumns = tableColumns(database, "items");
-  if (!sessionColumns.has("workspace_key") || !itemColumns.has("item_type")) {
+  const checkpointColumns = tableColumns(database, "turn_checkpoints");
+  if (
+    !sessionColumns.has("workspace_key") ||
+    !turnColumns.has("termination_reason") ||
+    !itemColumns.has("item_type") ||
+    !checkpointColumns.has("through_item_sequence") ||
+    !schemaObjectExists(database, "trigger", "turns_termination_insert_guard") ||
+    !schemaObjectExists(database, "trigger", "turns_termination_update_guard") ||
+    !schemaObjectExists(database, "trigger", "turns_terminal_update_guard") ||
+    !schemaObjectExists(database, "trigger", "items_running_turn_insert_guard") ||
+    !schemaObjectExists(
+      database,
+      "trigger",
+      "turn_checkpoints_running_turn_insert_guard",
+    ) ||
+    !schemaObjectExists(
+      database,
+      "trigger",
+      "turn_checkpoints_item_reference_guard",
+    ) ||
+    !schemaObjectExists(database, "trigger", "turn_checkpoints_order_guard")
+  ) {
     throw new Error(
-      "数据库 Schema 与当前版本 1 不一致；请先备份并重建本地开发数据库",
+      `数据库 Schema 与当前版本 ${CURRENT_SCHEMA_VERSION} 不一致；` +
+        "请先备份并重建本地开发数据库",
     );
   }
 }
@@ -183,6 +419,11 @@ export async function initializeStateDatabase(
   try {
     database = new DatabaseSync(databasePath);
     configureDatabase(database);
+    await backupBeforeMigration(
+      database,
+      databasePath,
+      schemaVersion(database),
+    );
     migrateDatabase(database);
     validateCurrentSchema(database);
     return database;

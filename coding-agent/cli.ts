@@ -5,12 +5,15 @@ import type { DatabaseSync } from "node:sqlite";
 import OpenAI from "openai";
 
 import { parseCliInput, type CliCommand } from "./cli_commands.ts";
+import { CliTurnController } from "./cli_turn_controller.ts";
 import { loadRuntime } from "./config.ts";
 import { ReActRuntime, type ResponsesClient } from "./runtime.ts";
 import {
   createRuntimeSession,
+  prepareTurnRecovery,
   prepareRuntimeSession,
   type PreparedRuntimeSession,
+  resumeRuntimeSession,
   restoreRuntimeSession,
 } from "./session/bootstrap.ts";
 import { SessionStore } from "./session/store.ts";
@@ -118,6 +121,8 @@ export async function runCli(): Promise<void> {
   let store: SessionStore | undefined;
   let agent: ReActRuntime | undefined;
   let activeSessionId: string | undefined;
+  const turnController = new CliTurnController();
+  let closeActiveTextLine = () => undefined;
 
   const sessionInput = {
     model: runtimeConfig.provider.model,
@@ -167,17 +172,21 @@ export async function runCli(): Promise<void> {
     const runtimeSession = prepareRuntimeSession(await requireStore(), sessionInput);
     const restoredAgent = await activateSession(runtimeSession);
     if (runtimeSession.restoredTurnCount > 0) {
-      console.log(`已恢复 ${runtimeSession.restoredTurnCount} 个完整回合。`);
+      console.log(`已恢复 ${runtimeSession.restoredTurnCount} 个可用回合。`);
     }
     return restoredAgent;
   }
 
-  try {
-    await runInteractiveSession({
-      ask: () => terminal.question("请输入任务（输入 exit 退出）: "),
-      handleInput: async (input) => {
-        let textLineOpen = false;
-        const turn = await (await requireAgent()).runTurn(
+  async function executeInput(input: string): Promise<void> {
+    let textLineOpen = false;
+    closeActiveTextLine = () => {
+      if (!textLineOpen) return;
+      stdout.write("\n");
+      textLineOpen = false;
+    };
+    try {
+      await turnController.run(async (signal) => {
+        const result = await (await requireAgent()).runTurn(
           input,
           (line) => {
             if (textLineOpen) stdout.write("\n");
@@ -188,18 +197,75 @@ export async function runCli(): Promise<void> {
             stdout.write(text);
             textLineOpen = true;
           },
+          { signal },
         );
         if (textLineOpen) {
           stdout.write("\n");
-        } else if (!turn.streamed) {
-          console.log(turn.reply);
+          textLineOpen = false;
+        } else if (!result.streamed) {
+          console.log(result.reply);
         }
-      },
+      });
+    } finally {
+      closeActiveTextLine = () => undefined;
+    }
+  }
+
+  async function recoverTurn(
+    mode: "continue" | "retry",
+    turnId: string,
+  ): Promise<void> {
+    if (activeSessionId === undefined) {
+      throw new Error("当前没有活动会话，请先使用 /resume 恢复会话");
+    }
+
+    const recovery = prepareTurnRecovery(
+      await requireStore(),
+      activeSessionId,
+      mode,
+      turnId,
+      sessionInput,
+    );
+    await activateSession(recovery);
+
+    if (mode === "continue") {
+      const nextInput = (await terminal.question("请输入继续指令: ")).trim();
+      if (nextInput.length === 0) {
+        throw new Error("继续指令不能为空，原活动会话未被修改");
+      }
+      await executeInput(nextInput);
+      return;
+    }
+
+    if (recovery.retryInput === undefined) {
+      throw new Error(`Turn ${turnId} 没有可重试的原始用户目标`);
+    }
+    await executeInput(recovery.retryInput);
+  }
+
+  try {
+    const handleInterrupt = () => {
+      const action = turnController.interrupt();
+      if (action === "cancelled") {
+        closeActiveTextLine();
+        stdout.write("\n正在取消当前任务...\n");
+        return;
+      }
+      if (action === "closing") {
+        terminal.close();
+      }
+    };
+    terminal.on("SIGINT", handleInterrupt);
+    await runInteractiveSession({
+      ask: () => terminal.question("请输入任务（输入 exit 退出）: "),
+      handleInput: executeInput,
       handleCommand: async (command) => {
         if (command.type === "help") {
           console.log(
             "/sessions 列出会话 | /new [标题] 新建会话 | " +
-              "/switch <session-id> 切换会话 | /exit 退出",
+              "/resume [session-id] 恢复会话 | /switch <session-id> " +
+              "切换会话 | /continue <turn-id> 继续 | " +
+              "/retry <turn-id> 重试 | /exit 退出",
           );
           return;
         }
@@ -243,8 +309,29 @@ export async function runCli(): Promise<void> {
           await activateSession(restored);
           console.log(
             `已切换到 Session: ${restored.session.id}，恢复 ` +
-              `${restored.restoredTurnCount} 个完整回合。`,
+              `${restored.restoredTurnCount} 个可用回合。`,
           );
+          return;
+        }
+        if (command.type === "resume-session") {
+          const resumed = resumeRuntimeSession(
+            sessionStore,
+            command.sessionId,
+            sessionInput,
+          );
+          await activateSession(resumed);
+          console.log(
+            `已恢复 Session: ${resumed.session.id}，恢复 ` +
+              `${resumed.restoredTurnCount} 个可用回合。`,
+          );
+          return;
+        }
+        if (command.type === "continue-turn") {
+          await recoverTurn("continue", command.turnId);
+          return;
+        }
+        if (command.type === "retry-turn") {
+          await recoverTurn("retry", command.turnId);
         }
       },
       onError: (error) => {

@@ -16,12 +16,16 @@
 - 精确编辑：支持原子写入、唯一文本替换和 unified diff。
 - 命令执行：使用结构化 argv、`shell: false`、超时和输出截断。
 - Windows 沙箱：优先使用 WSL2 + bubblewrap，支持 strict 和显式 soft fallback。
-- SQLite 会话层：包含 Schema 迁移、外键、WAL、Session/Turn/Item 事务写入、Runtime 生命周期记录和完整 Turn 恢复。
+- SQLite 会话层：包含 Schema 迁移、外键、WAL、Session/Turn/Item 事务写入、Turn 终态原因记录和完整 Turn 恢复。
 - CLI 会话恢复：按工作区自动恢复模型和系统 Prompt 均兼容的最近会话，配置变化时隔离创建新会话。
 - CLI 多轮交互：同一进程内复用 Runtime 和 Session，支持连续处理任务，单轮失败不会阻断后续输入。
 - 显式会话管理：支持列出、新建和切换当前工作区会话，切换时校验模型与系统 Prompt 兼容性。
 - 上下文压缩：根据 Responses API 返回的输入 token 用量自动摘要较早 Turn，同时保留近期完整工具上下文。
-- 任务取消：Runtime 支持注入 `AbortSignal`，可在模型请求、流式接收和工具步骤之间安全取消当前任务。
+- 任务终止：Runtime 支持注入 `AbortSignal` 安全取消当前任务，并严格区分用户或进程中断与网络、服务商、协议、模型及持久化失败；失败或中断后，普通后续 Turn 会保留安全上下文。
+- 安全重放基础：会话恢复和普通后续输入通过纯函数 Replay Builder 投影 canonical Items；完整工具调用与结果可以继续使用，孤立 Item 会被过滤并返回结构化警告；显式 `continue / retry` 保留指定来源语义。
+- 持久化检查点：完整模型 Response 以原子 Item 批次写入并创建检查点，工具结果与 `function_call` 配对校验后在同一事务中保存，支持按最后安全边界恢复。
+- 工作区一致性：文件工具会针对本轮实际涉及文件生成轻量 SHA-256 指纹，并随工具结果检查点保存；指纹只用于发现可能的磁盘差异，不自动覆盖工作区。
+- CLI 取消控制：独立交互状态机区分空闲、运行中、取消中和关闭状态；运行中第一次 Ctrl+C 只取消当前 Turn，空闲时 Ctrl+C 才关闭 CLI，排版状态与业务状态保持隔离。
 
 > CLI 支持自动接续和显式切换；会话重命名与删除命令尚未实现。
 
@@ -75,9 +79,9 @@ context_window = 400000
 
 `streaming` 默认为 `true`，普通模型调用通过 SSE 实时输出文本。若兼容的第三方 Provider 已实现 `/responses` 但不支持流式事件，可将其设为 `false`，运行时会使用非流式响应；上下文压缩固定使用非流式请求。无论采用哪种模式，只有终态 Response 中的完整 Items 会写入会话，文本增量不会单独持久化。
 
-Runtime 的 `runTurn` 支持通过可选 `AbortSignal` 取消当前任务。取消发生在请求前时不会创建 Turn；发生在模型请求、流式事件接收或工具步骤之间时，会回滚本轮内存上下文，并将已创建的 Turn 记录为失败，避免局部 Items 进入下一轮。当前取消能力是本地 Runtime 控制接口，服务端 background 任务和轮询将在独立阶段实现。
+Runtime 的 `runTurn` 支持通过可选 `AbortSignal` 取消当前任务。取消发生在请求前时不会创建 Turn；发生在模型请求、流式事件接收或工具步骤之间时，会保留当前 Turn 中可安全重放的上下文，并将已创建的 Turn 记录为 `interrupted / user_cancelled`。网络、服务商、协议、模型和持久化等客观故障记录为带结构化原因的 `failed`。工具已经执行完成时，Runtime 会先持久化完整 `function_call_output` 再响应取消，避免工作区副作用与审计历史失配；没有结果的工具调用不会进入下一次模型请求。当前能力仍是本地前台 Turn 控制；服务端 background 任务、远端轮询与取消将在独立阶段实现。
 
-会话状态默认保存在用户目录的 `.coding-agent/state.sqlite`。数据库包含原始提问、模型输出和工具结果；CLI 在首次实际任务前显示隐私提示。启动同一工作区时，仅当模型和系统 Prompt 的 SHA-256 指纹均一致才会恢复最近会话，否则会创建隔离的新 Session。输入 `exit` 或 `quit` 可退出交互循环。
+会话状态默认保存在用户目录的 `.coding-agent/state.sqlite`。数据库包含原始提问、模型输出、工具结果和检查点；CLI 在首次实际任务前显示隐私提示。状态数据库使用版本迁移、外键、WAL 和事务机制；已有旧版本数据库迁移前会先进行完整性检查并创建版本化备份。启动同一工作区时，仅当模型和系统 Prompt 的 SHA-256 指纹均一致才会恢复最近会话，否则会创建隔离的新 Session。输入 `exit` 或 `quit` 可退出交互循环。
 
 交互过程中可使用以下会话命令：
 
@@ -85,7 +89,10 @@ Runtime 的 `runTurn` 支持通过可选 `AbortSignal` 取消当前任务。取�
 | --- | --- |
 | `/sessions` | 按最近更新时间列出当前工作区最多 20 个会话 |
 | `/new [标题]` | 创建新会话并立即切换，标题可省略 |
+| `/resume [session-id]` | 恢复当前工作区最近的兼容会话，或恢复指定会话 |
 | `/switch <session-id>` | 恢复并切换到指定会话 |
+| `/continue <turn-id>` | 使用失败或中断 Turn 的安全上下文，并输入新的继续指令 |
+| `/retry <turn-id>` | 使用失败或中断 Turn 的原始用户目标创建新的重试 Turn |
 | `/help` | 显示可用命令 |
 | `/exit` | 退出程序 |
 
@@ -154,6 +161,10 @@ coding-agent/
 ├── cli.ts                    # CLI 装配与审批交互
 ├── config.ts                 # TOML 配置加载和校验
 ├── runtime.ts                # ReAct 模型循环
+├── cli_turn_controller.ts    # CLI Turn 交互状态机与 Ctrl+C 控制
+├── replay.ts                 # 审计历史到 canonical Items 的安全投影
+├── checkpoint.ts             # 检查点类型、元数据和领域校验
+├── turn_lifecycle.ts         # Turn 状态、终止原因与契约校验
 ├── sqlite.ts                 # SQLite Schema 与迁移
 ├── session/                  # SessionStore、Turn 与 Item 持久化
 ├── file_change_tracker.ts    # 文件变更和 diff
@@ -164,9 +175,61 @@ coding-agent/
 
 ## 开发状态
 
-当前版本已完成 Responses API ReAct 工具链与流式输出、Runtime 任务取消接口、权限模型、文件安全、Windows 沙箱框架、Runtime 会话记录接口、CLI 多轮会话管理和自动上下文压缩。后续将继续完善 CLI 取消交互和长任务执行能力。
+当前版本已完成 Responses API ReAct 工具链与流式输出、Turn 取消/失败终态分流、安全重放、失败或中断后的普通后续上下文、持久化检查点与原子 Item 批次、权限模型、文件安全、Windows 沙箱框架、Runtime 会话记录接口、CLI 多轮会话管理、CLI Ctrl+C 取消状态机、`/resume` 会话恢复、`/continue`/`/retry` 显式恢复和自动上下文压缩。下一步接入检查点与工作区差异提示、Token usage 可观测性和 background 长任务能力。
 
 ## 更新记录
+
+### 2026-09-20
+
+- feat | 新增 `/continue <turn-id>` 和 `/retry <turn-id>` 显式恢复命令；前者使用失败或中断 Turn 的安全 Replay 前缀接收新的继续指令，后者重新提交原始用户目标。
+- 新增 `SessionStore.prepareTurnRecovery` 和 `prepareTurnRecovery` 会话装配入口，统一校验工作区、模型、系统 Prompt、来源 Turn 状态、检查点边界和安全 Replay。
+- 恢复操作始终创建新的 Turn，旧 Turn 保持终态不可变；`retry` 不把来源 Turn 的用户输入重复放入初始 Items，而是作为新 Turn 的输入重新提交。
+- 拒绝从 `completed` 或 `running` Turn 恢复，不重放孤立工具调用、未完成参数或来源 Turn 之后的历史。
+- 补充命令解析、CLI 分发、`continue/retry` Replay、来源 Turn 状态保护和旧 Turn 不变测试；完整测试 121 项中 120 项通过，1 项 Windows WSL 沙箱真实集成测试因环境条件跳过。
+
+### 2026-09-19
+
+- feat | 新增 `/resume [session-id]` 会话恢复命令；无参数时按当前工作区、模型和系统 Prompt 指纹恢复最近兼容 Session，带参数时恢复指定 Session。
+- 新增 `findLatestCompatibleSession` 查询能力，避免 `/resume` 无参数时误恢复模型或系统 Prompt 不兼容的会话。
+- `/resume` 与现有 `/switch <session-id>` 共用 `restoreRuntimeSession` 装配流程，恢复失败时不替换当前活动 Runtime；`/switch` 保留为兼容入口。
+- 补充命令解析、CLI 命令分发、最近兼容 Session 选择和指定不兼容 Session 拒绝测试。
+
+### 2026-09-18
+
+- feat | 新增独立 `CliTurnController`，以 `idle / running / cancelling / closing` 管理 CLI Turn 交互状态，避免把 Ctrl+C 逻辑耦合到终端排版状态。
+- 接入 readline `SIGINT`：运行中第一次 Ctrl+C 只触发当前 Turn 的 `AbortController`，取消中的重复 Ctrl+C 不重复终止，空闲时 Ctrl+C 关闭 CLI。
+- 将 CLI 当前 Turn 的 `AbortSignal` 传入 Runtime，并在取消时先关闭已打开的文本行，保证流式文本、日志和取消提示不会混排。
+- 补充状态机正常完成、失败恢复、重复取消、空闲退出和 CLI 命令兼容性测试；完整测试 117 项中 116 项通过，1 项 Windows WSL 沙箱真实集成测试因环境条件跳过。
+
+### 2026-09-15
+
+- feat | 新增 `follow_up` 上下文投影模式，使普通后续 Turn 能保留失败或中断 Turn 中已经形成的用户输入、消息、推理项以及完整的工具调用结果。
+- 加固失败收尾的一致性：Turn 终态成功落库后，Runtime 优先从 SessionStore 的真实审计 Items 和检查点重新构建 `follow_up` 上下文；无持久化 Replay 能力时才使用内存投影降级，保证运行中恢复与进程重启恢复使用同一套事实来源。
+- 统一 Runtime 新增用户输入的 canonical Item 格式，始终使用 `type: "message"`、`role: "user"` 和 `content` 字段，避免内存上下文与持久化 Replay 的结构不一致。
+- 调整运行时失败收尾逻辑：先通过 Replay Builder 提取安全上下文，再移除未完成或状态未知的 Item；工具只有调用没有结果时不会被下一轮模型请求重放。
+- 调整进程恢复范围：遗留 `running` Turn 先记录为 `interrupted / process_exited`，随后与其他终态 Turn 一起经过统一安全投影，保证会话连续性和协议完整性使用同一套规则。
+- 补充普通后续输入、未完成工具调用过滤、终态会话恢复和失败 Turn 用户输入保留测试；新增失败与中断 Turn 上下文连续性阶段开发任务文档。
+
+### 2026-09-14
+
+- feat | 将状态数据库 Schema 升级到 v3，新增 `turn_checkpoints` 表、外键、检查点类型约束、Item 引用约束和严格递增约束；旧版本迁移前执行完整性检查并生成版本化备份。
+- 将完整模型 Response 的 output Items 改为单批次事务写入，并创建 `model_response` 检查点；工具执行结果与对应 `function_call` 在同一事务中写入并创建 `tool_result` 检查点，批次失败时整体回滚。
+- 新增检查点领域类型与元数据校验，恢复对象读取检查点边界，Replay Builder 遵守最后已提交检查点，避免把未形成闭环的局部 Item 重新提交给模型。
+- 文件变更跟踪器按本轮实际涉及文件生成带版本、文件清单和内容哈希的稳定 SHA-256 工作区指纹，并随工具结果检查点保存；无文件副作用或无法安全识别路径时不生成指纹。补充迁移、原子事务、检查点恢复、指纹和 Runtime 原子接口测试。
+
+### 2026-09-11
+
+- feat | 新增纯函数 Replay Builder，将本地审计 Turn 投影为可发送给模型的 canonical Items；role-only message 会统一为带 `type: "message"` 的内部表示，调用参数和结果按 Responses `call_id` 顺序校验。
+- 普通会话恢复只重放 `completed` Turn；显式 `continue` 才保留失败或中断 Turn 的完整工具前缀，`retry` 单独返回原始目标，并在来源 Turn 处截断后续历史，避免重复输入和时间倒流上下文。
+- Replay Builder 对未知 Item、非法参数、重复调用、孤立调用、孤立结果和调用结果乱序返回结构化 warning，并在不修改审计历史的前提下采用保守截断策略。
+- SessionStore 新增受工作区边界保护的显式 replay 入口，普通未压缩会话恢复也通过 Replay Builder 归一化完整 Turn；来源 Turn 之后的历史不会混入继续上下文。补充 canonical 归一化、失败/中断安全前缀、配对校验、显式来源 Turn、输入不可变和异常 Item 过滤测试。
+
+- feat | 建立 Turn 终态语义与结构化终止原因，将生命周期固定为 `running -> completed / failed / interrupted`，并保持所有终态不可再次追加或结束。
+- 将用户主动取消记录为 `interrupted / user_cancelled`，启动恢复发现的遗留运行中 Turn 记录为 `interrupted / process_exited`；取消不再复用失败分支，也不具备自动重试语义。
+- 对网络超时、网络连接、服务商异常、服务商取消、协议异常、模型不完整、模型拒绝、持久化故障和步骤上限进行明确分类，Runtime 与 SessionStore 通过类型化原因传递，不依赖错误字符串决定业务状态。
+- 调整工具取消顺序：工具产生完整 observation 后先持久化 `function_call_output`，再检查取消信号，保证已经发生的工作区副作用拥有对应审计结果；未完成的流式 delta 仍只用于显示。
+- SQLite Schema 升级到 v2，新增 `turns.termination_reason`，对既有失败和进程中断记录做保守回填，并通过列约束、触发器和 TypeScript 校验共同拒绝非法状态/原因组合、终态回退及终态 Item 追加。
+- 补充取消、工具完成后取消、网络错误分类、模型状态分类、持久化失败原因、进程恢复、迁移回填和数据库约束测试；后续将从纯函数 Replay Builder 开始实现失败或取消后的安全继续能力。
 
 ### 2026-09-10
 
@@ -225,9 +288,9 @@ coding-agent/
 - feat | 新增独立 Session 装配模块，集中处理系统 Prompt 指纹、最近 Session 兼容性判断、完整 Turn 恢复和 Runtime 注入参数，避免将恢复策略耦合到 CLI 或 Runtime。
 - CLI 收到非空任务后初始化用户级状态数据库，按规范化工作区查找最近 Session；首次使用时创建 Session，后续自动注入 SessionRecorder 与已恢复的 Responses Items。
 - 仅当模型标识与系统 Prompt 的 SHA-256 指纹均一致时恢复会话；模型或 Prompt 变化会创建新 Session，防止不兼容的消息、推理项和工具上下文混入新请求。
-- 恢复时沿用 SessionStore 的完整 Turn 边界，只重放 completed Turn；上次进程遗留的 running Turn 会标记为 interrupted，不进入模型上下文。
+- 恢复时沿用 SessionStore 的完整 Turn 边界，并通过 Replay Builder 保留终态 Turn 的安全上下文；上次进程遗留的 running Turn 会标记为 interrupted，未完成工具调用仍不会进入模型上下文。
 - 空输入不会初始化数据库或创建空 Session；数据库、WAL 连接和终端均通过明确的资源生命周期关闭，启动或运行失败不会遗留打开的数据库句柄。
-- CLI 显示本地状态隐私提示，并在实际恢复到历史时报告完整回合数量；状态默认保存在用户目录 `.coding-agent/state.sqlite`。
+- CLI 显示本地状态隐私提示，并在实际恢复到历史时报告可用回合数量；状态默认保存在用户目录 `.coding-agent/state.sqlite`。
 - 补充首次 Session 创建、兼容会话恢复、未完成回合排除、模型变化和 Prompt 变化隔离测试。
 - 验证结果：`npm run typecheck` 通过；`npm test` 共 63 项测试，62 项通过，1 项真实 WSL2 沙箱测试因环境条件跳过。
 

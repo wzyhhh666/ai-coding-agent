@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { createTwoFilesPatch } from "diff";
 
 import { truncate, workspacePath } from "./tools/_common.ts";
+import { createWorkspaceFingerprint } from "./workspace_fingerprint.ts";
 
 type FileSnapshot = {
   exists: boolean;
@@ -96,5 +97,17 @@ export class FileChangeTracker {
       if (change !== undefined) changes.push(change);
     }
     return changes;
+  }
+
+  /** 仅根据本轮实际捕获过的文件生成指纹，不扫描整个工作区。 */
+  workspaceFingerprint(): string | undefined {
+    const entries = [...this.finalSnapshots.entries()].map(
+      ([pathValue, snapshotValue]) => ({
+        path: pathValue,
+        exists: snapshotValue.exists,
+        content: snapshotValue.content,
+      }),
+    );
+    return createWorkspaceFingerprint(entries);
   }
 }

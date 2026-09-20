@@ -59,7 +59,15 @@ test("runInteractiveSession 读取端关闭时正常结束", async () => {
 });
 
 test("runInteractiveSession 将会话命令独立分发", async () => {
-  const inputs = ["/sessions", "/new title", "/switch session-1", "/exit"];
+  const inputs = [
+    "/sessions",
+    "/new title",
+    "/resume",
+    "/continue turn-1",
+    "/retry turn-1",
+    "/switch session-1",
+    "/exit",
+  ];
   const commandTypes: string[] = [];
 
   await runInteractiveSession({
@@ -79,6 +87,9 @@ test("runInteractiveSession 将会话命令独立分发", async () => {
   assert.deepEqual(commandTypes, [
     "list-sessions",
     "new-session",
+    "resume-session",
+    "continue-turn",
+    "retry-turn",
     "switch-session",
   ]);
 });

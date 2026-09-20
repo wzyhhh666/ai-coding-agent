@@ -18,6 +18,21 @@ test("parseCliInput 区分任务、退出和会话命令", () => {
     type: "switch-session",
     sessionId: "session-1",
   });
+  assert.deepEqual(parseCliInput("/resume"), {
+    type: "resume-session",
+  });
+  assert.deepEqual(parseCliInput("/resume session-1"), {
+    type: "resume-session",
+    sessionId: "session-1",
+  });
+  assert.deepEqual(parseCliInput("/continue turn-1"), {
+    type: "continue-turn",
+    turnId: "turn-1",
+  });
+  assert.deepEqual(parseCliInput("/retry turn-1"), {
+    type: "retry-turn",
+    turnId: "turn-1",
+  });
 });
 
 test("parseCliInput 为缺少参数和未知命令返回明确错误", () => {
@@ -36,5 +51,17 @@ test("parseCliInput 为缺少参数和未知命令返回明确错误", () => {
   assert.deepEqual(parseCliInput("/switch first second"), {
     type: "invalid",
     message: "用法: /switch <session-id>",
+  });
+  assert.deepEqual(parseCliInput("/resume first second"), {
+    type: "invalid",
+    message: "用法: /resume [session-id]",
+  });
+  assert.deepEqual(parseCliInput("/continue"), {
+    type: "invalid",
+    message: "用法: /continue <turn-id>",
+  });
+  assert.deepEqual(parseCliInput("/retry first second"), {
+    type: "invalid",
+    message: "用法: /retry <turn-id>",
   });
 });

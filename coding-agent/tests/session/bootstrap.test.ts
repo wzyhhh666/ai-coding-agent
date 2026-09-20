@@ -8,6 +8,7 @@ import test from "node:test";
 import {
   createRuntimeSession,
   prepareRuntimeSession,
+  resumeRuntimeSession,
   restoreRuntimeSession,
   systemPromptHash,
 } from "../../session/bootstrap.ts";
@@ -100,15 +101,15 @@ test("prepareRuntimeSession 恢复模型和 Prompt 一致的完整回合", async
     assert.equal(restored.session.id, created.session.id);
     assert.equal(restored.restoredTurnCount, 1);
     assert.deepEqual(restored.initialItems, [
-      { role: "user", content: "hello" },
-      { role: "assistant", content: "world" },
+      { type: "message", role: "user", content: "hello" },
+      { type: "message", role: "assistant", content: "world" },
     ]);
   } finally {
     await closeTestContext(context);
   }
 });
 
-test("prepareRuntimeSession 恢复时排除并中断未完成回合", async () => {
+test("prepareRuntimeSession 恢复时中断未完成回合并保留安全上下文", async () => {
   const context = await createTestContext();
   try {
     const store = new SessionStore(context.database, "./workspace", {
@@ -129,8 +130,10 @@ test("prepareRuntimeSession 恢复时排除并中断未完成回合", async () =
       "SELECT status FROM turns WHERE id = ?",
     ).get("turn-1") as { status: string };
 
-    assert.equal(restored.restoredTurnCount, 0);
-    assert.deepEqual(restored.initialItems, []);
+    assert.equal(restored.restoredTurnCount, 1);
+    assert.deepEqual(restored.initialItems, [
+      { type: "message", role: "user", content: "unfinished" },
+    ]);
     assert.equal(status.status, "interrupted");
   } finally {
     await closeTestContext(context);
@@ -186,6 +189,53 @@ test("显式新建支持标题，按 ID 恢复会校验当前配置", async () =
     assert.equal(restored.session.id, "session-1");
     assert.throws(
       () => restoreRuntimeSession(store, first.session.id, {
+        model: "model-b",
+        systemPrompt: "prompt-a",
+      }),
+      /不兼容/,
+    );
+  } finally {
+    await closeTestContext(context);
+  }
+});
+
+test("resumeRuntimeSession 无参数恢复最近兼容 Session", async () => {
+  const context = await createTestContext();
+  try {
+    const store = new SessionStore(context.database, "./workspace", {
+      now: sequence([1, 2, 3, 4]),
+      createId: sequence(["session-incompatible", "session-compatible"]),
+    });
+    const input = { model: "model-a", systemPrompt: "prompt-a" };
+    createRuntimeSession(store, {
+      model: "model-b",
+      systemPrompt: "prompt-b",
+    });
+    const compatible = createRuntimeSession(store, input);
+
+    const resumed = resumeRuntimeSession(store, undefined, input);
+
+    assert.equal(resumed.session.id, compatible.session.id);
+    assert.equal(resumed.restoredTurnCount, 0);
+  } finally {
+    await closeTestContext(context);
+  }
+});
+
+test("resumeRuntimeSession 指定不兼容 Session 时拒绝恢复", async () => {
+  const context = await createTestContext();
+  try {
+    const store = new SessionStore(context.database, "./workspace", {
+      now: () => 1,
+      createId: () => "session-1",
+    });
+    const session = createRuntimeSession(store, {
+      model: "model-a",
+      systemPrompt: "prompt-a",
+    });
+
+    assert.throws(
+      () => resumeRuntimeSession(store, session.session.id, {
         model: "model-b",
         systemPrompt: "prompt-a",
       }),

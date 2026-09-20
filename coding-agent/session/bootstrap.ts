@@ -5,6 +5,7 @@ import {
   restoredItems,
   type SessionRecord,
   SessionStore,
+  type TurnRecoveryMode,
 } from "./store.ts";
 
 export type RuntimeSessionInput = {
@@ -74,6 +75,59 @@ export function restoreRuntimeSession(
     recorder: store.recorder(restored.session.id),
     initialItems: restoredItems(restored),
     restoredTurnCount: restored.turns.length,
+  };
+}
+
+export function resumeRuntimeSession(
+  store: SessionStore,
+  sessionId: string | undefined,
+  input: RuntimeSessionInput,
+): PreparedRuntimeSession {
+  const targetSession = sessionId === undefined
+    ? store.findLatestCompatibleSession(
+      input.model,
+      systemPromptHash(input.systemPrompt),
+    )
+    : store.getSession(sessionId);
+
+  if (targetSession === undefined) {
+    throw new Error("当前工作区没有与当前模型和系统 Prompt 兼容的会话");
+  }
+
+  return restoreRuntimeSession(store, targetSession.id, input);
+}
+
+export type PreparedTurnRecovery = PreparedRuntimeSession & {
+  mode: TurnRecoveryMode;
+  sourceTurnId: string;
+  retryInput?: string;
+};
+
+export function prepareTurnRecovery(
+  store: SessionStore,
+  sessionId: string,
+  mode: TurnRecoveryMode,
+  sourceTurnId: string,
+  input: RuntimeSessionInput,
+): PreparedTurnRecovery {
+  const session = store.getSession(sessionId);
+  if (!isCompatible(session, input)) {
+    throw new Error(
+      `Session ${sessionId} 的模型或系统 Prompt 与当前配置不兼容`,
+    );
+  }
+
+  const recovery = store.prepareTurnRecovery(sessionId, mode, sourceTurnId);
+  return {
+    session,
+    recorder: store.recorder(session.id),
+    initialItems: recovery.items,
+    restoredTurnCount: recovery.replay.includedTurnIds.length,
+    mode,
+    sourceTurnId,
+    ...(recovery.retryInput === undefined
+      ? {}
+      : { retryInput: recovery.retryInput }),
   };
 }
 

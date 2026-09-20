@@ -1,6 +1,16 @@
 import type { Runtime } from "./config.ts";
+import type { CheckpointMetadata } from "./checkpoint.ts";
+import {
+  buildReplay,
+  type ReplayMode,
+  type ReplayResult,
+} from "./replay.ts";
 import type { ResponseToolSpec, ToolRegistry } from "./tools/registry.ts";
 import { toResponseTools } from "./tools/registry.ts";
+import type {
+  TurnFailureReason,
+  TurnInterruptionReason,
+} from "./turn_lifecycle.ts";
 
 export type RuntimeTurn = {
   input: string;
@@ -30,8 +40,30 @@ export function compactionItem(summary: string): ResponseInputItem {
 export type SessionRecorder = {
   startTurn(userInput: string): Promise<string>;
   appendItem(turnId: string, item: ResponseInputItem): Promise<void>;
+  appendModelResponse?(
+    turnId: string,
+    items: ResponseInputItem[],
+    metadata?: CheckpointMetadata,
+  ): Promise<void>;
+  appendToolResult?(
+    turnId: string,
+    item: ResponseInputItem,
+    metadata?: CheckpointMetadata,
+  ): Promise<void>;
   completeTurn(turnId: string): Promise<void>;
-  failTurn(turnId: string, error: unknown): Promise<void>;
+  failTurn(
+    turnId: string,
+    error: unknown,
+    reason: TurnFailureReason,
+  ): Promise<void>;
+  interruptTurn(
+    turnId: string,
+    reason: TurnInterruptionReason,
+  ): Promise<void>;
+  buildTurnReplay?(
+    turnId: string,
+    mode?: ReplayMode,
+  ): Promise<ReplayResult>;
   prepareCompaction?(
     keepRecentTurns: number,
   ): Promise<CompactionInput | undefined>;
@@ -51,9 +83,26 @@ export type RunTurnOptions = {
 };
 
 export class TurnCancelledError extends Error {
+  readonly reason: TurnInterruptionReason;
+
   constructor() {
     super("任务已取消");
     this.name = "TurnCancelledError";
+    this.reason = "user_cancelled";
+  }
+}
+
+export class TurnFailureError extends Error {
+  readonly reason: TurnFailureReason;
+
+  constructor(
+    reason: TurnFailureReason,
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "TurnFailureError";
+    this.reason = reason;
   }
 }
 
@@ -139,22 +188,33 @@ function isFunctionCall(item: ResponseInputItem): item is FunctionCall {
     typeof item.arguments === "string";
 }
 
-function responseErrorMessage(response: ModelResponse): string {
+function responseFailure(response: ModelResponse): TurnFailureError {
   if (response.status === "incomplete") {
     const details = response.incomplete_details === null ||
         response.incomplete_details === undefined
       ? "无详细信息"
       : JSON.stringify(response.incomplete_details);
-    return `模型响应不完整: ${details}`;
+    return new TurnFailureError(
+      "model_incomplete",
+      `模型响应不完整: ${details}`,
+    );
   }
 
   if (response.status === "failed") {
     const code = response.error?.code ? ` (${response.error.code})` : "";
-    return `模型响应失败${code}: ${response.error?.message ?? "无详细信息"}`;
+    return new TurnFailureError(
+      "provider_error",
+      `模型响应失败${code}: ${response.error?.message ?? "无详细信息"}`,
+    );
   }
 
-  if (response.status === "cancelled") return "模型响应已取消";
-  return `同步模型请求返回了非终态: ${response.status}`;
+  if (response.status === "cancelled") {
+    return new TurnFailureError("provider_cancelled", "模型响应已取消");
+  }
+  return new TurnFailureError(
+    "protocol_error",
+    `同步模型请求返回了非终态: ${response.status}`,
+  );
 }
 
 function refusalText(items: ResponseInputItem[]): string | undefined {
@@ -176,12 +236,61 @@ function refusalText(items: ResponseInputItem[]): string | undefined {
   return undefined;
 }
 
-function requestFailure(error: unknown): Error {
+function errorField(error: unknown, field: string): unknown {
+  if (error === null || typeof error !== "object") return undefined;
+  return (error as Record<string, unknown>)[field];
+}
+
+function requestFailureReason(error: unknown): TurnFailureReason {
+  const name = errorField(error, "name");
+  const code = errorField(error, "code");
   const message = error instanceof Error ? error.message : String(error);
-  return new Error(
+  if (
+    name === "APIConnectionTimeoutError" ||
+    (typeof code === "string" && /timed?out/i.test(code)) ||
+    /timed?\s*out|timeout/i.test(message)
+  ) {
+    return "network_timeout";
+  }
+  if (
+    name === "APIConnectionError" ||
+    (typeof code === "string" && /^(ECONN|ENET|EAI_)/.test(code))
+  ) {
+    return "network_error";
+  }
+  return "provider_error";
+}
+
+function requestFailure(error: unknown): TurnFailureError {
+  const message = error instanceof Error ? error.message : String(error);
+  return new TurnFailureError(
+    requestFailureReason(error),
     `Responses API 请求失败: ${message}。请确认当前 Provider、base_url 和模型支持 /responses。`,
     { cause: error },
   );
+}
+
+function protocolFailure(message: string): TurnFailureError {
+  return new TurnFailureError("protocol_error", message);
+}
+
+function persistenceFailure(error: unknown): TurnFailureError {
+  const message = error instanceof Error ? error.message : String(error);
+  return new TurnFailureError("persistence_error", message, { cause: error });
+}
+
+function toolFailure(error: unknown): TurnFailureError {
+  if (error instanceof TurnFailureError) return error;
+  const message = error instanceof Error ? error.message : String(error);
+  return new TurnFailureError(
+    "tool_error",
+    `工具执行链失败: ${message}`,
+    { cause: error },
+  );
+}
+
+function failureReason(error: unknown): TurnFailureReason {
+  return error instanceof TurnFailureError ? error.reason : "unknown";
 }
 
 function throwIfAborted(signal?: AbortSignal): void {
@@ -192,6 +301,7 @@ function preserveCancellation(error: unknown, signal?: AbortSignal): Error {
   if (error instanceof TurnCancelledError || signal?.aborted) {
     return error instanceof TurnCancelledError ? error : new TurnCancelledError();
   }
+  if (error instanceof TurnFailureError) return error;
   return requestFailure(error);
 }
 
@@ -215,6 +325,24 @@ function emitSafely(callback: (text: string) => void, text: string): boolean {
   } catch {
     // 终端或 UI 输出失败不应改变模型调用、工具执行和持久化语义。
     return false;
+  }
+}
+
+function attachErrorDiagnostic(
+  error: unknown,
+  field: string,
+  diagnostic: unknown,
+): void {
+  if (error === null || (typeof error !== "object" && typeof error !== "function")) {
+    return;
+  }
+  try {
+    Object.defineProperty(error, field, {
+      value: diagnostic,
+      configurable: true,
+    });
+  } catch {
+    // 原始运行错误始终优先，附加诊断失败时不再产生次生错误。
   }
 }
 
@@ -264,8 +392,12 @@ export class ReActRuntime {
 
     try {
       throwIfAborted(options.signal);
-      turnId = await this.recorder?.startTurn(userInput);
-      this.inputItems.push({ role: "user", content: userInput });
+      turnId = await this.startRecordedTurn(userInput);
+      this.inputItems.push({
+        type: "message",
+        role: "user",
+        content: userInput,
+      });
       let largestInputTokenCount = 0;
 
       for (let step = 0; step < this.runtime.maxSteps; step += 1) {
@@ -289,10 +421,10 @@ export class ReActRuntime {
         }
 
         if (response.status !== "completed") {
-          throw new Error(responseErrorMessage(response));
+          throw responseFailure(response);
         }
         if (!Array.isArray(response.output) || response.output.length === 0) {
-          throw new Error("模型响应为空");
+          throw protocolFailure("模型响应为空");
         }
         largestInputTokenCount = Math.max(
           largestInputTokenCount,
@@ -300,15 +432,26 @@ export class ReActRuntime {
         );
 
         // 完整重放输出，确保推理项和函数调用上下文不会丢失。
-        await this.appendItems(turnId, response.output);
+        await this.appendModelResponse(
+          turnId,
+          response.output,
+          { responseId: response.id },
+        );
         const functionCalls = response.output.filter(isFunctionCall);
 
         if (functionCalls.length === 0) {
           const refusal = refusalText(response.output);
-          if (refusal !== undefined) throw new Error(`模型拒绝请求: ${refusal}`);
-          if (response.output_text.length === 0) throw new Error("模型响应没有文本输出");
+          if (refusal !== undefined) {
+            throw new TurnFailureError(
+              "model_refusal",
+              `模型拒绝请求: ${refusal}`,
+            );
+          }
+          if (response.output_text.length === 0) {
+            throw protocolFailure("模型响应没有文本输出");
+          }
           emitSafely(output, `${stepLabel} ← 最终回答`);
-          if (turnId !== undefined) await this.recorder?.completeTurn(turnId);
+          if (turnId !== undefined) await this.completeRecordedTurn(turnId);
           await this.compactContextIfNeeded(largestInputTokenCount, output);
           return {
             input: userInput,
@@ -322,31 +465,76 @@ export class ReActRuntime {
           `${stepLabel} ← 工具调用，共 ${functionCalls.length} 个`,
         );
         for (const [index, call] of functionCalls.entries()) {
+          throwIfAborted(options.signal);
           emitSafely(
             output,
             `  [Tool ${index + 1}/${functionCalls.length}] ${call.name}`,
           );
-          const observation = await this.tools.execute(call.name, call.arguments);
-          throwIfAborted(options.signal);
+          let observation: string;
+          try {
+            observation = await this.tools.execute(call.name, call.arguments);
+          } catch (error) {
+            throw toolFailure(error);
+          }
           emitSafely(output,
             `  [Tool ${index + 1}/${functionCalls.length}] Observation: ${observation}`,
           );
-          await this.appendItems(turnId, [{
+          await this.appendToolResult(turnId, {
             type: "function_call_output",
             call_id: call.call_id,
             output: observation,
-          }]);
+          }, {
+            functionCallId: call.call_id,
+            workspaceFingerprint: this.tools.workspaceFingerprint(),
+          });
+          // 工具可能已经产生副作用，结果必须先持久化再响应取消。
+          throwIfAborted(options.signal);
         }
       }
-      throw new Error(`已达到最大步骤数 ${this.runtime.maxSteps}`);
+      throw new TurnFailureError(
+        "step_limit",
+        `已达到最大步骤数 ${this.runtime.maxSteps}`,
+      );
     } catch (error) {
-      // 失败 Turn 不进入下一轮上下文，保持内存历史与后续持久化语义一致。
+      const turnItems = this.inputItems.slice(turnStartIndex);
+      const terminationRecorded = turnId !== undefined
+        ? await this.recordTurnTermination(turnId, error)
+        : false;
+      const persistedItems = terminationRecorded && turnId !== undefined
+        ? await this.buildPersistedFollowUpItems(turnId, error)
+        : undefined;
+      const safeItems = persistedItems ?? this.safeFollowUpItems(
+        userInput,
+        turnItems,
+        error,
+      );
       this.inputItems.length = turnStartIndex;
-      if (turnId !== undefined) await this.recordTurnFailure(turnId, error);
+      this.inputItems.push(...safeItems);
       throw error;
     } finally {
       this.tools.finishTurn();
     }
+  }
+
+  private safeFollowUpItems(
+    userInput: string,
+    turnItems: ResponseInputItem[],
+    error: unknown,
+  ): ResponseInputItem[] {
+    const status = error instanceof TurnCancelledError
+      ? "interrupted"
+      : "failed";
+    const replay = buildReplay({
+      mode: "follow_up",
+      turns: [{
+        id: "runtime-current-turn",
+        sequence: 1,
+        userInput,
+        status,
+        items: turnItems,
+      }],
+    });
+    return replay.items;
   }
 
   private createRequest(): ResponsesRequest {
@@ -387,7 +575,10 @@ export class ReActRuntime {
         const message = typeof event.message === "string"
           ? event.message
           : "无详细信息";
-        throw new Error(`流式响应失败${code}: ${message}`);
+        throw new TurnFailureError(
+          "provider_error",
+          `流式响应失败${code}: ${message}`,
+        );
       } else if (
         event.type === "response.completed" ||
         event.type === "response.failed" ||
@@ -399,35 +590,91 @@ export class ReActRuntime {
       }
     }
     if (terminalResponse === undefined) {
-      throw new Error("流式响应结束但未收到终态事件");
+      throw protocolFailure("流式响应结束但未收到终态事件");
     }
     return terminalResponse;
   }
 
-  private async appendItems(
+  private async appendModelResponse(
     turnId: string | undefined,
     items: ResponseInputItem[],
+    metadata: CheckpointMetadata,
   ): Promise<void> {
-    for (const item of items) {
-      if (turnId !== undefined) await this.recorder?.appendItem(turnId, item);
-      this.inputItems.push(item);
+    try {
+      if (turnId !== undefined && this.recorder?.appendModelResponse !== undefined) {
+        await this.recorder.appendModelResponse(turnId, items, metadata);
+      } else if (turnId !== undefined) {
+        for (const item of items) {
+          await this.recorder?.appendItem(turnId, item);
+        }
+      }
+      this.inputItems.push(...items);
+    } catch (error) {
+      throw persistenceFailure(error);
     }
   }
 
-  private async recordTurnFailure(turnId: string, error: unknown): Promise<void> {
+  private async appendToolResult(
+    turnId: string | undefined,
+    item: ResponseInputItem,
+    metadata: CheckpointMetadata,
+  ): Promise<void> {
     try {
-      await this.recorder?.failTurn(turnId, error);
-    } catch (persistenceError) {
-      if (error !== null && (typeof error === "object" || typeof error === "function")) {
-        try {
-          Object.defineProperty(error, "persistenceError", {
-            value: persistenceError,
-            configurable: true,
-          });
-        } catch {
-          // 原始运行错误始终优先，附加诊断失败时不再产生次生错误。
-        }
+      if (turnId !== undefined && this.recorder?.appendToolResult !== undefined) {
+        await this.recorder.appendToolResult(turnId, item, metadata);
+      } else if (turnId !== undefined) {
+        await this.recorder?.appendItem(turnId, item);
       }
+      this.inputItems.push(item);
+    } catch (error) {
+      throw persistenceFailure(error);
+    }
+  }
+
+  private async startRecordedTurn(userInput: string): Promise<string | undefined> {
+    try {
+      return await this.recorder?.startTurn(userInput);
+    } catch (error) {
+      throw persistenceFailure(error);
+    }
+  }
+
+  private async completeRecordedTurn(turnId: string): Promise<void> {
+    try {
+      await this.recorder?.completeTurn(turnId);
+    } catch (error) {
+      throw persistenceFailure(error);
+    }
+  }
+
+  private async recordTurnTermination(
+    turnId: string,
+    error: unknown,
+  ): Promise<boolean> {
+    try {
+      if (error instanceof TurnCancelledError) {
+        await this.recorder?.interruptTurn(turnId, error.reason);
+      } else {
+        await this.recorder?.failTurn(turnId, error, failureReason(error));
+      }
+      return true;
+    } catch (persistenceError) {
+      attachErrorDiagnostic(error, "persistenceError", persistenceError);
+      return false;
+    }
+  }
+
+  private async buildPersistedFollowUpItems(
+    turnId: string,
+    error: unknown,
+  ): Promise<ResponseInputItem[] | undefined> {
+    if (this.recorder?.buildTurnReplay === undefined) return undefined;
+    try {
+      const replay = await this.recorder.buildTurnReplay(turnId, "follow_up");
+      return replay.items;
+    } catch (replayError) {
+      attachErrorDiagnostic(error, "replayError", replayError);
+      return undefined;
     }
   }
 
@@ -473,7 +720,7 @@ export class ReActRuntime {
         undefined,
       );
       if (response.status !== "completed") {
-        throw new Error(responseErrorMessage(response));
+        throw responseFailure(response);
       }
       const summary = response.output_text.trim();
       if (summary.length === 0) throw new Error("压缩响应没有文本输出");

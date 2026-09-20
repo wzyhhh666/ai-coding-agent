@@ -3,11 +3,35 @@ import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
 import {
+  isCheckpointKind,
+  validateCheckpointMetadata,
+  type CheckpointKind,
+  type CheckpointMetadata,
+  type TurnCheckpoint,
+} from "../checkpoint.ts";
+import {
   compactionItem,
   type CompactionInput,
   type ResponseInputItem,
   type SessionRecorder,
 } from "../runtime.ts";
+import {
+  buildReplay,
+  type ReplayCheckpoint,
+  type ReplayMode,
+  type ReplayResult,
+} from "../replay.ts";
+import {
+  isTurnStatus,
+  isTurnTerminationReason,
+  type TurnFailureReason,
+  type TurnInterruptionReason,
+  type TurnStatus,
+  type TurnTerminationReason,
+  validateTurnTermination,
+} from "../turn_lifecycle.ts";
+
+export type { TurnStatus } from "../turn_lifecycle.ts";
 
 export type SessionRecord = {
   id: string;
@@ -19,8 +43,6 @@ export type SessionRecord = {
   systemPromptHash: string | null;
 };
 
-export type TurnStatus = "running" | "completed" | "failed" | "interrupted";
-
 export type TurnRecord = {
   id: string;
   sessionId: string;
@@ -30,10 +52,12 @@ export type TurnRecord = {
   startedAt: number;
   completedAt: number | null;
   error: string | null;
+  terminationReason: TurnTerminationReason | null;
 };
 
 export type RestoredTurn = TurnRecord & {
   items: ResponseInputItem[];
+  checkpoints?: ReplayCheckpoint[];
 };
 
 export type RestoredSession = {
@@ -49,16 +73,33 @@ export type CompactionRecord = {
   updatedAt: number;
 };
 
+export type { TurnCheckpoint } from "../checkpoint.ts";
+
 export function restoredItems(session: RestoredSession): ResponseInputItem[] {
   const compaction = session.compaction;
-  if (compaction === undefined) {
-    return session.turns.flatMap((turn) => turn.items);
-  }
-  const recentItems = session.turns
-    .filter((turn) => turn.sequence > compaction.throughTurnSequence)
-    .flatMap((turn) => turn.items);
-  return [compactionItem(compaction.summary), ...recentItems];
+  const candidateTurns = compaction === undefined
+    ? session.turns
+    : session.turns.filter((turn) => {
+      return turn.sequence > compaction.throughTurnSequence;
+    });
+  const replay = buildReplay({ mode: "follow_up", turns: candidateTurns });
+  return compaction === undefined
+    ? replay.items
+    : [compactionItem(compaction.summary), ...replay.items];
 }
+
+export type SessionReplayOptions = {
+  mode?: ReplayMode;
+  sourceTurnId?: string;
+};
+
+export type TurnRecoveryMode = "continue" | "retry";
+
+export type TurnRecovery = {
+  replay: ReplayResult;
+  items: ResponseInputItem[];
+  retryInput?: string;
+};
 
 export type CreateSessionInput = {
   title?: string;
@@ -123,18 +164,28 @@ function sessionFromRow(value: unknown): SessionRecord {
 function turnFromRow(value: unknown): TurnRecord {
   const data = row(value);
   const status = stringValue(data.status, "turns.status");
-  if (!["running", "completed", "failed", "interrupted"].includes(status)) {
+  if (!isTurnStatus(status)) {
     throw new Error(`数据库中的 Turn 状态非法: ${status}`);
   }
+  const rawReason = nullableString(
+    data.termination_reason,
+    "turns.termination_reason",
+  );
+  if (rawReason !== null && !isTurnTerminationReason(rawReason)) {
+    throw new Error(`数据库中的 Turn 终止原因非法: ${rawReason}`);
+  }
+  const terminationReason = rawReason as TurnTerminationReason | null;
+  validateTurnTermination(status, terminationReason);
   return {
     id: stringValue(data.id, "turns.id"),
     sessionId: stringValue(data.session_id, "turns.session_id"),
     sequence: numberValue(data.sequence, "turns.sequence"),
     userInput: stringValue(data.user_input, "turns.user_input"),
-    status: status as TurnStatus,
+    status,
     startedAt: numberValue(data.started_at, "turns.started_at"),
     completedAt: nullableNumber(data.completed_at, "turns.completed_at"),
     error: nullableString(data.error, "turns.error"),
+    terminationReason,
   };
 }
 
@@ -148,6 +199,35 @@ function compactionFromRow(value: unknown): CompactionRecord {
       "compactions.through_turn_sequence",
     ),
     updatedAt: numberValue(data.updated_at, "compactions.updated_at"),
+  };
+}
+
+function checkpointFromRow(value: unknown): TurnCheckpoint {
+  const data = row(value);
+  const kind = stringValue(data.kind, "turn_checkpoints.kind");
+  if (!isCheckpointKind(kind)) {
+    throw new Error(`数据库中的检查点类型非法: ${kind}`);
+  }
+  return {
+    id: stringValue(data.id, "turn_checkpoints.id"),
+    sessionId: stringValue(data.session_id, "turn_checkpoints.session_id"),
+    turnId: stringValue(data.turn_id, "turn_checkpoints.turn_id"),
+    sequence: numberValue(data.sequence, "turn_checkpoints.sequence"),
+    kind,
+    throughItemSequence: numberValue(
+      data.through_item_sequence,
+      "turn_checkpoints.through_item_sequence",
+    ),
+    responseId: nullableString(data.response_id, "turn_checkpoints.response_id"),
+    functionCallId: nullableString(
+      data.function_call_id,
+      "turn_checkpoints.function_call_id",
+    ),
+    workspaceFingerprint: nullableString(
+      data.workspace_fingerprint,
+      "turn_checkpoints.workspace_fingerprint",
+    ),
+    createdAt: numberValue(data.created_at, "turn_checkpoints.created_at"),
   };
 }
 
@@ -248,6 +328,22 @@ export class SessionStore {
     return result === undefined ? undefined : sessionFromRow(result);
   }
 
+  findLatestCompatibleSession(
+    model: string,
+    systemPromptHash: string,
+  ): SessionRecord | undefined {
+    const result = this.database.prepare(`
+      SELECT *
+      FROM sessions
+      WHERE workspace_key = ?
+        AND last_model = ?
+        AND system_prompt_hash = ?
+      ORDER BY updated_at DESC, created_at DESC, id DESC
+      LIMIT 1
+    `).get(this.workspaceKey, model, systemPromptHash);
+    return result === undefined ? undefined : sessionFromRow(result);
+  }
+
   listSessions(limit = 20): SessionRecord[] {
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
       throw new Error("Session 查询数量必须是 1 到 100 之间的整数");
@@ -304,12 +400,50 @@ export class SessionStore {
     });
   }
 
-  completeTurn(turnId: string): void {
-    this.finishTurn(turnId, "completed", null);
+  appendModelResponse(
+    turnId: string,
+    items: ResponseInputItem[],
+    metadata: CheckpointMetadata = {},
+  ): void {
+    this.appendItemsWithCheckpoint(turnId, items, "model_response", metadata);
   }
 
-  failTurn(turnId: string, error: unknown): void {
-    this.finishTurn(turnId, "failed", errorText(error));
+  appendToolResult(
+    turnId: string,
+    item: ResponseInputItem,
+    metadata: CheckpointMetadata = {},
+  ): void {
+    this.appendItemsWithCheckpoint(turnId, [item], "tool_result", metadata);
+  }
+
+  listTurnCheckpoints(turnId: string): TurnCheckpoint[] {
+    const turn = this.requireRunningOrFinishedTurn(turnId);
+    this.requireSessionForWorkspace(turn.sessionId);
+    return this.database.prepare(`
+      SELECT *
+      FROM turn_checkpoints
+      WHERE turn_id = ?
+      ORDER BY sequence ASC
+    `).all(turnId).map(checkpointFromRow);
+  }
+
+  completeTurn(turnId: string): void {
+    this.finishTurn(turnId, "completed", null, null);
+  }
+
+  failTurn(
+    turnId: string,
+    error: unknown,
+    reason: TurnFailureReason,
+  ): void {
+    this.finishTurn(turnId, "failed", errorText(error), reason);
+  }
+
+  interruptTurn(turnId: string, reason: TurnInterruptionReason): void {
+    const message = reason === "user_cancelled"
+      ? "用户取消了当前 Turn"
+      : "进程在 Turn 完成前结束";
+    this.finishTurn(turnId, "interrupted", message, reason);
   }
 
   restoreSession(sessionId: string): RestoredSession {
@@ -318,19 +452,26 @@ export class SessionStore {
       const timestamp = this.now();
       this.database.prepare(`
         UPDATE turns
-        SET status = 'interrupted', completed_at = ?, error = COALESCE(error, ?)
+        SET status = 'interrupted',
+            completed_at = ?,
+            error = COALESCE(error, ?),
+            termination_reason = 'process_exited'
         WHERE session_id = ? AND status = 'running'
       `).run(timestamp, "上次进程在 Turn 完成前结束", sessionId);
 
       const turnRows = this.database.prepare(`
         SELECT *
         FROM turns
-        WHERE session_id = ? AND status = 'completed'
+        WHERE session_id = ? AND status IN ('completed', 'failed', 'interrupted')
         ORDER BY sequence ASC
       `).all(sessionId);
       const turns = turnRows.map((turnRow) => {
         const turn = turnFromRow(turnRow);
-        return { ...turn, items: this.turnItems(sessionId, turn.id) };
+        return {
+          ...turn,
+          items: this.turnItems(sessionId, turn.id),
+          checkpoints: this.replayCheckpoints(sessionId, turn.id),
+        };
       });
       const compaction = this.findCompaction(sessionId);
       return {
@@ -339,6 +480,110 @@ export class SessionStore {
         ...(compaction === undefined ? {} : { compaction }),
       };
     });
+  }
+
+  buildSessionReplay(
+    sessionId: string,
+    options: SessionReplayOptions = {},
+  ): ReplayResult {
+    this.requireSessionForWorkspace(sessionId);
+    const turns = this.database.prepare(`
+      SELECT *
+      FROM turns
+      WHERE session_id = ?
+      ORDER BY sequence ASC
+    `).all(sessionId).map((turnRow) => {
+      const turn = turnFromRow(turnRow);
+      return {
+        id: turn.id,
+        sequence: turn.sequence,
+        userInput: turn.userInput,
+        status: turn.status,
+        items: this.turnItems(sessionId, turn.id),
+        checkpoints: this.replayCheckpoints(sessionId, turn.id),
+      };
+    });
+
+    return buildReplay({
+      turns,
+      ...(options.mode === undefined ? {} : { mode: options.mode }),
+      ...(options.sourceTurnId === undefined
+        ? {}
+        : { sourceTurnId: options.sourceTurnId }),
+    });
+  }
+
+  buildTurnReplay(
+    turnId: string,
+    mode: ReplayMode = "follow_up",
+  ): ReplayResult {
+    const turn = this.requireRunningOrFinishedTurn(turnId);
+    this.requireSessionForWorkspace(turn.sessionId);
+    if (turn.status === "running") {
+      throw new Error(`运行中的 Turn 不能构建 ${mode} Replay: ${turnId}`);
+    }
+
+    return buildReplay({
+      mode,
+      turns: [{
+        id: turn.id,
+        sequence: turn.sequence,
+        userInput: turn.userInput,
+        status: turn.status,
+        items: this.turnItems(turn.sessionId, turn.id),
+        checkpoints: this.replayCheckpoints(turn.sessionId, turn.id),
+      }],
+      ...(mode === "restore" ? {} : { sourceTurnId: turn.id }),
+    });
+  }
+
+  prepareTurnRecovery(
+    sessionId: string,
+    mode: TurnRecoveryMode,
+    sourceTurnId: string,
+  ): TurnRecovery {
+    const sourceTurn = this.requireRunningOrFinishedTurn(sourceTurnId);
+    if (sourceTurn.sessionId !== sessionId) {
+      throw new Error(`Turn ${sourceTurnId} 不属于 Session ${sessionId}`);
+    }
+    if (sourceTurn.status !== "failed" && sourceTurn.status !== "interrupted") {
+      throw new Error(
+        `Turn ${sourceTurnId} 不是可恢复的 failed 或 interrupted Turn`,
+      );
+    }
+
+    const restored = this.restoreSession(sessionId);
+    const candidateTurns = restored.compaction === undefined
+      ? restored.turns
+      : restored.turns.filter((turn) => {
+        return turn.sequence > restored.compaction!.throughTurnSequence;
+      });
+    const replay = buildReplay({
+      mode,
+      turns: candidateTurns,
+      sourceTurnId,
+    });
+
+    if (replay.source?.turnId !== sourceTurnId) {
+      throw new Error(
+        `Turn ${sourceTurnId} 不是可恢复的 failed 或 interrupted Turn`,
+      );
+    }
+
+    if (mode === "retry" && replay.retryInput === undefined) {
+      throw new Error(`Turn ${sourceTurnId} 没有可重试的原始用户目标`);
+    }
+
+    const items = restored.compaction === undefined
+      ? replay.items
+      : [compactionItem(restored.compaction.summary), ...replay.items];
+    return {
+      replay,
+      items,
+      ...(replay.retryInput === undefined
+        ? {}
+        : { retryInput: replay.retryInput }),
+    };
   }
 
   prepareCompaction(
@@ -423,8 +668,22 @@ export class SessionStore {
     return {
       startTurn: async (userInput) => this.startTurn(sessionId, userInput),
       appendItem: async (turnId, item) => this.appendItem(turnId, item),
+      appendModelResponse: async (turnId, items, metadata) => {
+        this.appendModelResponse(turnId, items, metadata);
+      },
+      appendToolResult: async (turnId, item, metadata) => {
+        this.appendToolResult(turnId, item, metadata);
+      },
       completeTurn: async (turnId) => this.completeTurn(turnId),
-      failTurn: async (turnId, error) => this.failTurn(turnId, error),
+      failTurn: async (turnId, error, reason) => {
+        this.failTurn(turnId, error, reason);
+      },
+      interruptTurn: async (turnId, reason) => {
+        this.interruptTurn(turnId, reason);
+      },
+      buildTurnReplay: async (turnId, mode) => {
+        return this.buildTurnReplay(turnId, mode);
+      },
       prepareCompaction: async (keepRecentTurns) => {
         return this.prepareCompaction(sessionId, keepRecentTurns);
       },
@@ -452,6 +711,37 @@ export class SessionStore {
       ORDER BY sequence ASC
     `).all(sessionId, turnId).map((itemRow) => {
       return deserializeItem(row(itemRow).payload_json);
+    });
+  }
+
+  private replayCheckpoints(
+    sessionId: string,
+    turnId: string,
+  ): ReplayCheckpoint[] {
+    return this.database.prepare(`
+      SELECT kind, through_item_sequence
+      FROM turn_checkpoints
+      WHERE session_id = ? AND turn_id = ?
+      ORDER BY sequence ASC
+    `).all(sessionId, turnId).map((checkpointRow) => {
+      const checkpoint = row(checkpointRow);
+      const kind = stringValue(checkpoint.kind, "turn_checkpoints.kind");
+      if (!isCheckpointKind(kind)) {
+        throw new Error(`数据库中的检查点类型非法: ${kind}`);
+      }
+      const throughItemSequence = numberValue(
+        checkpoint.through_item_sequence,
+        "turn_checkpoints.through_item_sequence",
+      );
+      const count = row(this.database.prepare(`
+        SELECT COUNT(*) AS count
+        FROM items
+        WHERE session_id = ? AND turn_id = ? AND sequence <= ?
+      `).get(sessionId, turnId, throughItemSequence)).count;
+      return {
+        kind,
+        throughItemCount: numberValue(count, "turn_checkpoints.item_count"),
+      };
     });
   }
 
@@ -503,6 +793,115 @@ export class SessionStore {
     return numberValue(result.next_sequence, "items.next_sequence");
   }
 
+  private nextCheckpointSequence(turnId: string): number {
+    const result = row(this.database.prepare(`
+      SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence
+      FROM turn_checkpoints
+      WHERE turn_id = ?
+    `).get(turnId));
+    return numberValue(result.next_sequence, "turn_checkpoints.next_sequence");
+  }
+
+  private appendItemsWithCheckpoint(
+    turnId: string,
+    items: ResponseInputItem[],
+    kind: CheckpointKind,
+    metadata: CheckpointMetadata,
+  ): void {
+    if (items.length === 0) throw new Error("检查点批次不能是空数组");
+    validateCheckpointMetadata(kind, metadata);
+    const serializedItems = items.map((item) => ({
+      type: itemType(item),
+      payload: serializeItem(item),
+    }));
+
+    this.transaction(() => {
+      const turn = this.requireRunningTurn(turnId);
+      this.requireSessionForWorkspace(turn.sessionId);
+      if (kind === "tool_result") {
+        this.requireFunctionCallOutputPair(
+          turn.sessionId,
+          turnId,
+          items[0]!,
+          metadata.functionCallId,
+        );
+        this.requireUncheckpointedFunctionCall(
+          turnId,
+          metadata.functionCallId!,
+        );
+      }
+
+      const timestamp = this.now();
+      let lastItemSequence = 0;
+      for (const item of serializedItems) {
+        lastItemSequence = this.insertSerializedItem(
+          turn.sessionId,
+          turnId,
+          item.type,
+          item.payload,
+          timestamp,
+        );
+      }
+      this.database.prepare(`
+        INSERT INTO turn_checkpoints
+          (id, session_id, turn_id, sequence, kind, through_item_sequence,
+           response_id, function_call_id, workspace_fingerprint, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        this.createId(),
+        turn.sessionId,
+        turnId,
+        this.nextCheckpointSequence(turnId),
+        kind,
+        lastItemSequence,
+        metadata.responseId ?? null,
+        metadata.functionCallId ?? null,
+        metadata.workspaceFingerprint ?? null,
+        timestamp,
+      );
+      this.touchSession(turn.sessionId, timestamp);
+    });
+  }
+
+  private requireFunctionCallOutputPair(
+    sessionId: string,
+    turnId: string,
+    item: ResponseInputItem,
+    functionCallId: string | undefined,
+  ): void {
+    if (
+      item.type !== "function_call_output" ||
+      typeof item.call_id !== "string" ||
+      functionCallId !== item.call_id
+    ) {
+      throw new Error("tool_result 检查点必须引用对应的 function_call_output");
+    }
+    const callItems = this.database.prepare(`
+      SELECT payload_json
+      FROM items
+      WHERE session_id = ? AND turn_id = ? AND item_type = 'function_call'
+    `).all(sessionId, turnId);
+    for (const callItem of callItems) {
+      const payload = deserializeItem(row(callItem).payload_json);
+      if (payload.call_id === functionCallId) return;
+    }
+    throw new Error(`找不到对应 function_call: ${functionCallId}`);
+  }
+
+  private requireUncheckpointedFunctionCall(
+    turnId: string,
+    functionCallId: string,
+  ): void {
+    const existing = this.database.prepare(`
+      SELECT 1 AS found
+      FROM turn_checkpoints
+      WHERE turn_id = ? AND kind = 'tool_result' AND function_call_id = ?
+    `).get(turnId, functionCallId);
+    if (existing !== undefined) {
+      throw new Error(`function_call 已经创建过工具结果检查点: ${functionCallId}`);
+    }
+  }
+
   private insertItem(
     sessionId: string,
     turnId: string,
@@ -524,7 +923,8 @@ export class SessionStore {
     type: string,
     payload: string,
     timestamp: number,
-  ): void {
+  ): number {
+    const sequence = this.nextItemSequence(sessionId);
     this.database.prepare(`
       INSERT INTO items
         (session_id, turn_id, sequence, item_type, payload_json, created_at)
@@ -532,27 +932,38 @@ export class SessionStore {
     `).run(
       sessionId,
       turnId,
-      this.nextItemSequence(sessionId),
+      sequence,
       type,
       payload,
       timestamp,
     );
+    return sequence;
+  }
+
+  private requireRunningOrFinishedTurn(turnId: string): TurnRecord {
+    const result = this.database.prepare(`
+      SELECT * FROM turns WHERE id = ?
+    `).get(turnId);
+    if (result === undefined) throw new Error(`Turn 不存在: ${turnId}`);
+    return turnFromRow(result);
   }
 
   private finishTurn(
     turnId: string,
-    status: "completed" | "failed",
+    status: "completed" | "failed" | "interrupted",
     error: string | null,
+    terminationReason: TurnTerminationReason | null,
   ): void {
+    validateTurnTermination(status, terminationReason);
     this.transaction(() => {
       const turn = this.requireRunningTurn(turnId);
       this.requireSessionForWorkspace(turn.sessionId);
       const timestamp = this.now();
       this.database.prepare(`
         UPDATE turns
-        SET status = ?, completed_at = ?, error = ?
+        SET status = ?, completed_at = ?, error = ?, termination_reason = ?
         WHERE id = ?
-      `).run(status, timestamp, error, turnId);
+      `).run(status, timestamp, error, terminationReason, turnId);
       this.touchSession(turn.sessionId, timestamp);
     });
   }
