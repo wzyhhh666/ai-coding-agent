@@ -8,6 +8,7 @@ export type CliInput =
   | { type: "resume-session"; sessionId?: string }
   | { type: "continue-turn"; turnId: string }
   | { type: "retry-turn"; turnId: string }
+  | { type: "rollback-turn"; turnId: string }
   | { type: "switch-session"; sessionId: string }
   | { type: "invalid"; message: string };
 
@@ -62,6 +63,11 @@ export function parseCliInput(value: string): CliInput {
     return argument.length === 0 || /\s/.test(argument)
       ? { type: "invalid", message: "用法: /retry <turn-id>" }
       : { type: "retry-turn", turnId: argument };
+  }
+  if (command === "/rollback") {
+    return argument.length === 0 || /\s/.test(argument)
+      ? { type: "invalid", message: "用法: /rollback <turn-id>" }
+      : { type: "rollback-turn", turnId: argument };
   }
   if (command === "/switch") {
     return argument.length === 0 || /\s/.test(argument)

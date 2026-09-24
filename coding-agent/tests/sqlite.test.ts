@@ -27,6 +27,8 @@ async function removeSqliteTestFiles(
     `${databasePath}-wal`,
     `${databasePath}.backup-v1`,
     `${databasePath}.backup-v2`,
+    `${databasePath}.backup-v3`,
+    `${databasePath}.backup-v4`,
     databasePath,
   ]) {
     await unlink(filePath).catch((error: NodeJS.ErrnoException) => {
@@ -77,6 +79,8 @@ test("状态数据库初始化 Schema、PRAGMA 和文件权限", async () => {
       "turn_checkpoints_running_turn_insert_guard",
       "turn_checkpoints_item_reference_guard",
       "turn_checkpoints_order_guard",
+      "file_change_events",
+      "file_change_events_turn_sequence_idx",
     ]) {
       assert.equal(schemaNames.has(name), true, `缺少数据库对象: ${name}`);
     }
@@ -86,6 +90,7 @@ test("状态数据库初始化 Schema、PRAGMA 和文件权限", async () => {
       }),
     );
     assert.equal(turnColumns.has("termination_reason"), true);
+    assert.equal(turnColumns.has("workspace_baseline_json"), true);
 
     database.prepare(`
       INSERT INTO sessions

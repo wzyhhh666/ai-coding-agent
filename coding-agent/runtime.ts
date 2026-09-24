@@ -1,5 +1,6 @@
 import type { Runtime } from "./config.ts";
 import type { CheckpointMetadata } from "./checkpoint.ts";
+import type { WorkspaceBaseline } from "./workspace_change_backend.ts";
 import {
   buildReplay,
   type ReplayMode,
@@ -38,7 +39,7 @@ export function compactionItem(summary: string): ResponseInputItem {
 }
 
 export type SessionRecorder = {
-  startTurn(userInput: string): Promise<string>;
+  startTurn(userInput: string, workspaceBaseline?: WorkspaceBaseline): Promise<string>;
   appendItem(turnId: string, item: ResponseInputItem): Promise<void>;
   appendModelResponse?(
     turnId: string,
@@ -50,15 +51,20 @@ export type SessionRecorder = {
     item: ResponseInputItem,
     metadata?: CheckpointMetadata,
   ): Promise<void>;
-  completeTurn(turnId: string): Promise<void>;
+  completeTurn(
+    turnId: string,
+    workspaceEndBaseline?: WorkspaceBaseline,
+  ): Promise<void>;
   failTurn(
     turnId: string,
     error: unknown,
     reason: TurnFailureReason,
+    workspaceEndBaseline?: WorkspaceBaseline,
   ): Promise<void>;
   interruptTurn(
     turnId: string,
     reason: TurnInterruptionReason,
+    workspaceEndBaseline?: WorkspaceBaseline,
   ): Promise<void>;
   buildTurnReplay?(
     turnId: string,
@@ -392,7 +398,8 @@ export class ReActRuntime {
 
     try {
       throwIfAborted(options.signal);
-      turnId = await this.startRecordedTurn(userInput);
+      const workspaceBaseline = await this.tools.captureWorkspaceBaseline();
+      turnId = await this.startRecordedTurn(userInput, workspaceBaseline);
       this.inputItems.push({
         type: "message",
         role: "user",
@@ -435,7 +442,10 @@ export class ReActRuntime {
         await this.appendModelResponse(
           turnId,
           response.output,
-          { responseId: response.id },
+          {
+            responseId: response.id,
+            ...(await this.checkpointWorkspaceTreeMetadata()),
+          },
         );
         const functionCalls = response.output.filter(isFunctionCall);
 
@@ -451,7 +461,10 @@ export class ReActRuntime {
             throw protocolFailure("模型响应没有文本输出");
           }
           emitSafely(output, `${stepLabel} ← 最终回答`);
-          if (turnId !== undefined) await this.completeRecordedTurn(turnId);
+          if (turnId !== undefined) {
+            const endBaseline = await this.captureEndBaseline();
+            await this.completeRecordedTurn(turnId, endBaseline);
+          }
           await this.compactContextIfNeeded(largestInputTokenCount, output);
           return {
             input: userInput,
@@ -479,6 +492,9 @@ export class ReActRuntime {
           emitSafely(output,
             `  [Tool ${index + 1}/${functionCalls.length}] Observation: ${observation}`,
           );
+          const fileChanges = this.tools.takeFileChangeEvents();
+          const workspaceTreeMetadata =
+            await this.checkpointWorkspaceTreeMetadata();
           await this.appendToolResult(turnId, {
             type: "function_call_output",
             call_id: call.call_id,
@@ -486,6 +502,8 @@ export class ReActRuntime {
           }, {
             functionCallId: call.call_id,
             workspaceFingerprint: this.tools.workspaceFingerprint(),
+            ...workspaceTreeMetadata,
+            ...(fileChanges.length === 0 ? {} : { fileChanges }),
           });
           // 工具可能已经产生副作用，结果必须先持久化再响应取消。
           throwIfAborted(options.signal);
@@ -497,8 +515,11 @@ export class ReActRuntime {
       );
     } catch (error) {
       const turnItems = this.inputItems.slice(turnStartIndex);
+      const endBaseline = turnId !== undefined
+        ? await this.captureEndBaseline()
+        : undefined;
       const terminationRecorded = turnId !== undefined
-        ? await this.recordTurnTermination(turnId, error)
+        ? await this.recordTurnTermination(turnId, error, endBaseline)
         : false;
       const persistedItems = terminationRecorded && turnId !== undefined
         ? await this.buildPersistedFollowUpItems(turnId, error)
@@ -631,17 +652,23 @@ export class ReActRuntime {
     }
   }
 
-  private async startRecordedTurn(userInput: string): Promise<string | undefined> {
+  private async startRecordedTurn(
+    userInput: string,
+    workspaceBaseline: WorkspaceBaseline,
+  ): Promise<string | undefined> {
     try {
-      return await this.recorder?.startTurn(userInput);
+      return await this.recorder?.startTurn(userInput, workspaceBaseline);
     } catch (error) {
       throw persistenceFailure(error);
     }
   }
 
-  private async completeRecordedTurn(turnId: string): Promise<void> {
+  private async completeRecordedTurn(
+    turnId: string,
+    workspaceEndBaseline: WorkspaceBaseline | undefined,
+  ): Promise<void> {
     try {
-      await this.recorder?.completeTurn(turnId);
+      await this.recorder?.completeTurn(turnId, workspaceEndBaseline);
     } catch (error) {
       throw persistenceFailure(error);
     }
@@ -650,17 +677,46 @@ export class ReActRuntime {
   private async recordTurnTermination(
     turnId: string,
     error: unknown,
+    workspaceEndBaseline: WorkspaceBaseline | undefined,
   ): Promise<boolean> {
     try {
       if (error instanceof TurnCancelledError) {
-        await this.recorder?.interruptTurn(turnId, error.reason);
+        await this.recorder?.interruptTurn(
+          turnId,
+          error.reason,
+          workspaceEndBaseline,
+        );
       } else {
-        await this.recorder?.failTurn(turnId, error, failureReason(error));
+        await this.recorder?.failTurn(
+          turnId,
+          error,
+          failureReason(error),
+          workspaceEndBaseline,
+        );
       }
       return true;
     } catch (persistenceError) {
       attachErrorDiagnostic(error, "persistenceError", persistenceError);
       return false;
+    }
+  }
+
+  private async captureEndBaseline(): Promise<WorkspaceBaseline | undefined> {
+    try {
+      return await this.tools.captureWorkspaceBaseline();
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async checkpointWorkspaceTreeMetadata(): Promise<CheckpointMetadata> {
+    try {
+      const baseline = await this.tools.captureWorkspaceBaseline();
+      return baseline.kind === "git"
+        ? { workspaceTreeOid: baseline.treeOid }
+        : {};
+    } catch {
+      return {};
     }
   }
 

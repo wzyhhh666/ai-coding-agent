@@ -93,3 +93,11 @@ test("runInteractiveSession 将会话命令独立分发", async () => {
     "switch-session",
   ]);
 });
+
+test("parseCliInput 支持检查点回滚命令", async () => {
+  const { parseCliInput } = await import("../cli_commands.ts");
+  assert.deepEqual(parseCliInput("/rollback turn-1"), {
+    type: "rollback-turn",
+    turnId: "turn-1",
+  });
+});

@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
+
+import { workspacePath } from "./tools/_common.ts";
 
 export type WorkspaceFileFingerprint = {
   path: string;
@@ -11,6 +14,19 @@ export type WorkspaceFingerprint = {
   algorithm: "sha256";
   files: WorkspaceFileFingerprint[];
   digest: string;
+};
+
+export type WorkspaceRecoveryStatus =
+  | "matched"
+  | "changed"
+  | "missing_fingerprint"
+  | "unavailable";
+
+export type WorkspaceRecoveryCheck = {
+  status: WorkspaceRecoveryStatus;
+  checkpointId?: string;
+  changedFiles: string[];
+  message: string;
 };
 
 function sha256(value: string): string {
@@ -77,4 +93,85 @@ export function parseWorkspaceFingerprint(value: string): WorkspaceFingerprint {
     files,
     digest,
   };
+}
+
+function isMissingFile(error: unknown): boolean {
+  return error !== null &&
+    typeof error === "object" &&
+    "code" in error &&
+    error.code === "ENOENT";
+}
+
+async function currentFile(
+  pathValue: string,
+): Promise<{ path: string; exists: boolean; content: string }> {
+  const [target] = await workspacePath(pathValue);
+  try {
+    return {
+      path: pathValue,
+      exists: true,
+      content: await readFile(target, "utf8"),
+    };
+  } catch (error) {
+    if (isMissingFile(error)) {
+      return { path: pathValue, exists: false, content: "" };
+    }
+    throw error;
+  }
+}
+
+export async function compareWorkspaceFingerprint(
+  value: string | null | undefined,
+  checkpointId?: string,
+): Promise<WorkspaceRecoveryCheck> {
+  if (value === null || value === undefined || value.length === 0) {
+    return {
+      status: "missing_fingerprint",
+      ...(checkpointId === undefined ? {} : { checkpointId }),
+      changedFiles: [],
+      message: "恢复检查点没有工作区指纹，无法确认当前磁盘状态是否一致",
+    };
+  }
+
+  try {
+    const expected = parseWorkspaceFingerprint(value);
+    const currentFiles = await Promise.all(
+      expected.files.map((file) => currentFile(file.path)),
+    );
+    const currentValue = createWorkspaceFingerprint(currentFiles);
+    if (currentValue === value) {
+      return {
+        status: "matched",
+        ...(checkpointId === undefined ? {} : { checkpointId }),
+        changedFiles: [],
+        message: "当前工作区与恢复检查点一致",
+      };
+    }
+
+    const current = parseWorkspaceFingerprint(currentValue ?? "");
+    const expectedByPath = new Map(expected.files.map((file) => [file.path, file]));
+    const currentByPath = new Map(current.files.map((file) => [file.path, file]));
+    const changedFiles = [...new Set([
+      ...expected.files.map((file) => file.path),
+      ...current.files.map((file) => file.path),
+    ])].filter((pathValue) => {
+      const before = expectedByPath.get(pathValue);
+      const after = currentByPath.get(pathValue);
+      return before?.exists !== after?.exists ||
+        before?.contentSha256 !== after?.contentSha256;
+    });
+    return {
+      status: "changed",
+      ...(checkpointId === undefined ? {} : { checkpointId }),
+      changedFiles,
+      message: "检测到恢复检查点之后工作区发生变化",
+    };
+  } catch (error) {
+    return {
+      status: "unavailable",
+      ...(checkpointId === undefined ? {} : { checkpointId }),
+      changedFiles: [],
+      message: `无法检查恢复工作区状态: ${error instanceof Error ? error.message : error}`,
+    };
+  }
 }

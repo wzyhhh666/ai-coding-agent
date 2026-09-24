@@ -182,6 +182,38 @@ test("continue 优先遵守已提交检查点，不跨越检查点后的审计 I
   );
 });
 
+test("continue 支持选择来源 Turn 的历史检查点", () => {
+  const result = buildReplay({
+    turns: [{
+      ...interruptedTurn("interrupted", 1, [
+        { role: "user", content: "写入文件" },
+        functionCall,
+        functionOutput,
+        { type: "message", role: "assistant", content: "后续局部输出" },
+      ]),
+      checkpoints: [
+        {
+          id: "checkpoint-model",
+          kind: "model_response",
+          throughItemCount: 2,
+        },
+        {
+          id: "checkpoint-tool",
+          kind: "tool_result",
+          throughItemCount: 3,
+        },
+      ],
+    }],
+    mode: "continue",
+    sourceTurnId: "interrupted",
+    checkpointId: "checkpoint-model",
+  });
+
+  assert.deepEqual(result.items, [
+    { type: "message", role: "user", content: "写入文件" },
+  ]);
+});
+
 test("未配对调用、孤立结果和未知 Item 都不会进入投影", () => {
   const result = buildReplay({
     turns: [completedTurn("turn-1", 1, [

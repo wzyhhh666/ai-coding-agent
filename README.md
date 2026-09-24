@@ -25,6 +25,9 @@
 - 安全重放基础：会话恢复和普通后续输入通过纯函数 Replay Builder 投影 canonical Items；完整工具调用与结果可以继续使用，孤立 Item 会被过滤并返回结构化警告；显式 `continue / retry` 保留指定来源语义。
 - 持久化检查点：完整模型 Response 以原子 Item 批次写入并创建检查点，工具结果与 `function_call` 配对校验后在同一事务中保存，支持按最后安全边界恢复。
 - 工作区一致性：文件工具会针对本轮实际涉及文件生成轻量 SHA-256 指纹，并随工具结果检查点保存；指纹只用于发现可能的磁盘差异，不自动覆盖工作区。
+- 文件变更追踪：文件工具在前后快照之间生成 `create / modify / delete` 事件、真实内容哈希和 unified diff hunk 行范围，并与工具结果检查点在同一事务中落库；当前不记录修改者归属。
+- Git 工作区基线：Git 仓库在 Turn 开始和结束时通过独立临时 Index 保存 HEAD、真实 Index Tree 和工作区 Tree；可按 Turn 比较新增、修改、删除和重命名文件。`run_command` 在授权后按命令边界追踪 Git 工作区文件副作用，并随工具结果检查点落库；恢复前可按编号展开行级 diff，不修改真实暂存区，非 Git 工作区继续使用快照后端。
+- 检查点回滚：Git 检查点保存工作区 Tree OID，支持通过 `/rollback <turn-id>` 选择检查点、预览差异并在二次确认后恢复工作区文件；不修改真实 Index、HEAD 或提交历史，缺少 Tree 的历史检查点和非 Git 工作区不允许回滚。
 - CLI 取消控制：独立交互状态机区分空闲、运行中、取消中和关闭状态；运行中第一次 Ctrl+C 只取消当前 Turn，空闲时 Ctrl+C 才关闭 CLI，排版状态与业务状态保持隔离。
 
 > CLI 支持自动接续和显式切换；会话重命名与删除命令尚未实现。
@@ -162,12 +165,14 @@ coding-agent/
 ├── config.ts                 # TOML 配置加载和校验
 ├── runtime.ts                # ReAct 模型循环
 ├── cli_turn_controller.ts    # CLI Turn 交互状态机与 Ctrl+C 控制
+├── recovery_ui.ts             # 恢复检查点选择与工作区风险确认
 ├── replay.ts                 # 审计历史到 canonical Items 的安全投影
 ├── checkpoint.ts             # 检查点类型、元数据和领域校验
 ├── turn_lifecycle.ts         # Turn 状态、终止原因与契约校验
 ├── sqlite.ts                 # SQLite Schema 与迁移
 ├── session/                  # SessionStore、Turn 与 Item 持久化
 ├── file_change_tracker.ts    # 文件变更和 diff
+├── workspace_change_backend.ts # Git 工作区基线与快照降级后端
 ├── config/                   # Prompt、工具和本地配置
 ├── tools/                    # 工具、权限、注册表与沙箱
 └── tests/                    # 单元测试和可选集成测试
@@ -175,12 +180,46 @@ coding-agent/
 
 ## 开发状态
 
-当前版本已完成 Responses API ReAct 工具链与流式输出、Turn 取消/失败终态分流、安全重放、失败或中断后的普通后续上下文、持久化检查点与原子 Item 批次、权限模型、文件安全、Windows 沙箱框架、Runtime 会话记录接口、CLI 多轮会话管理、CLI Ctrl+C 取消状态机、`/resume` 会话恢复、`/continue`/`/retry` 显式恢复和自动上下文压缩。下一步接入检查点与工作区差异提示、Token usage 可观测性和 background 长任务能力。
+当前版本已完成 Responses API ReAct 工具链与流式输出、Turn 取消/失败终态分流、安全重放、失败或中断后的普通后续上下文、持久化检查点与原子 Item 批次、权限模型、文件安全、Windows 沙箱框架、Runtime 会话记录接口、CLI 多轮会话管理、CLI Ctrl+C 取消状态机、`/resume` 会话恢复、`/continue`/`/retry` 显式恢复、恢复前工作区差异确认、历史检查点选择、自动上下文压缩、工具级文件变更事件追踪、Turn 级 Git 工作区起止基线、基线差异查询、`run_command` 命令级副作用追踪、恢复前工作区变化摘要和可展开行级 diff 展示。下一步评估更细粒度的变更来源筛选和大型 diff 分页。
 
 ## 更新记录
 
+### 2026-09-24
+
+- feat | 在 `/continue` 和 `/retry` 进入恢复确认前展示来源 Turn 的工作区变化摘要，包含新增、修改、删除路径和 diff hunk 数量；展示逻辑只读，不自动覆盖、回滚或修改用户文件。
+- feat | 统一合并已落库的工具级文件事件与 Turn 级 Git 差异，按操作、路径和前后哈希去重；恢复确认前支持按编号展开完整 unified diff hunk 行内容，继续保持只读安全边界。
+- 验收 | 类型检查通过，完整测试 137 项中 136 项通过、1 项 Windows WSL 沙箱集成测试跳过，0 项失败。
+- feat | 为检查点增加工作区 Tree OID 和 `/rollback <turn-id>` 命令；回滚前展示差异并二次确认，回滚只写工作区文件，不改变真实 Git Index、HEAD 或提交历史。Schema 升级至 v7，完整测试 139 项中 138 项通过、1 项 Windows WSL 集成测试跳过。
+
+### 2026-09-23
+
+- feat | 为 `run_command` 增加命令边界文件副作用追踪：权限通过后在命令前后采集 Git Tree，识别新增、修改、删除和重命名，并将统一变更事件与对应工具结果检查点原子保存。
+- 命令返回非零退出码或超时时，只要执行器返回结果仍记录实际观察到的变化；追踪不可用时不阻止命令、不伪造变更。非 Git 工作区保持命令兼容，原有文件工具快照追踪不变。
+- 非 Git 工作区或 Git 差异采集不可用时，工具结果显式包含 `change_tracking: "unavailable"`，避免把“未能追踪”误认为“没有文件变化”；恢复 UI 只展示已确认的路径、操作类型和 diff hunk 数量。
+
+### 2026-09-22
+
+- feat | 新增 `WorkspaceChangeBackend` 分层契约和 Git/快照双后端；生产 CLI 在 Git 工作区优先生成 Git 基线，非 Git 工作区或 Git 捕获失败时自动降级，不影响工具执行。
+- Git 基线通过独立临时 Index 保存 Turn 开始和结束时的 HEAD、真实 Index Tree、工作区 Tree、仓库根目录、工作区前缀和对象格式；基线包含采集时已有的未提交和未跟踪文件，不执行 commit、stash、reset，也不修改真实 Index。
+- 新增 Git 基线差异服务，比较 Turn 起止 Tree 并转换为统一文件变更事件；支持新增、修改、删除以及重命名的删除+新增映射，记录 SHA-256 和 unified diff hunk 行范围。
+- SQLite Schema 升级至 v6，在 Turn 终态事务中保存结束工作区基线；补充 Git 起止基线差异、重命名路径、非 Git 后端和结束基线持久化测试。类型检查通过，完整测试 132 项中 131 项通过，1 项 Windows WSL 沙箱真实集成测试因环境条件跳过。
+- feat | `run_command` 在权限批准后、命令执行前后采集 Git 工作区基线，将命令产生的新增、修改、删除和重命名转换为已有文件事件，并随对应 `function_call_output` 检查点事务保存；命令失败或超时但仍返回结果时也记录已观察到的文件副作用。
+- 命令追踪复用 `FileChangeTracker`、Git Tree 比较服务和现有事件队列；非 Git 环境不生成猜测差异，已有文件工具快照继续工作。类型检查通过，完整测试结果见当前阶段修改总结文档。
+
+### 2026-09-21
+
+- feat | 新增工程级文件变更事件模型，围绕文件工具的前后快照记录 `create / modify / delete` 操作、相对路径、before/after SHA-256、unified diff hunk 的旧行/新行范围以及变更行内容。
+- 将工具名称随事件记录，并通过 `takeFileChangeEvents` 按工具消费，避免同一 Turn 的历史变更重复写入后续检查点；不记录用户或 Agent 修改者归属，保持追踪层只描述事实变化。
+- 新增 SQLite Schema v4 的 `file_change_events` 表、Turn 内递增序号、检查点外键、级联删除和查询索引；文件事件与 `function_call_output`、`tool_result` 检查点共用一个事务，失败时整体回滚。
+- 增加文件事件结构校验、事件读取接口、快照哈希和 diff hunk 测试；类型检查通过，完整测试 129 项中 128 项通过，1 项 Windows WSL 沙箱真实集成测试因环境条件跳过。
+
 ### 2026-09-20
 
+- feat | 为 `/continue` 和 `/retry` 增加恢复前工作区一致性检查；比较来源 Turn 指定检查点保存的指纹与当前实际文件状态。
+- 新增 `matched / changed / missing_fingerprint / unavailable` 四类恢复检查结果；变化、缺失或无法检查时默认拒绝，只有用户明确确认后才继续，不自动覆盖或回滚文件。
+- 新增历史检查点选择 UI；恢复命令列出检查点编号、类型、Response 或工具调用标识、Item 边界和指纹状态，支持选择历史检查点、默认最新检查点以及输入 `q` 取消。
+- Replay Builder 支持通过 `checkpointId` 选择来源 Turn 的指定检查点；选择较早模型检查点时过滤孤立工具调用，但保留已确认的用户消息和推理项。
+- 补充工作区指纹比较、恢复风险确认、历史检查点选择、指定检查点 Replay 和 SessionStore 检查点列表测试；完整测试 128 项中 127 项通过，1 项 Windows WSL 沙箱真实集成测试因环境条件跳过。
 - feat | 新增 `/continue <turn-id>` 和 `/retry <turn-id>` 显式恢复命令；前者使用失败或中断 Turn 的安全 Replay 前缀接收新的继续指令，后者重新提交原始用户目标。
 - 新增 `SessionStore.prepareTurnRecovery` 和 `prepareTurnRecovery` 会话装配入口，统一校验工作区、模型、系统 Prompt、来源 Turn 状态、检查点边界和安全 Replay。
 - 恢复操作始终创建新的 Turn，旧 Turn 保持终态不可变；`retry` 不把来源 Turn 的用户输入重复放入初始 Items，而是作为新 Turn 的输入重新提交。

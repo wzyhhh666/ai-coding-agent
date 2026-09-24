@@ -9,6 +9,12 @@ import { CliTurnController } from "./cli_turn_controller.ts";
 import { loadRuntime } from "./config.ts";
 import { ReActRuntime, type ResponsesClient } from "./runtime.ts";
 import {
+  confirmCheckpointRollback,
+  confirmUnsafeRecovery,
+  showWorkspaceChangesInteractive,
+  selectRecoveryCheckpoint,
+} from "./recovery_ui.ts";
+import {
   createRuntimeSession,
   prepareTurnRecovery,
   prepareRuntimeSession,
@@ -23,6 +29,11 @@ import {
 } from "./sqlite.ts";
 import { configureSandbox, configureWorkspace } from "./tools/index.ts";
 import { loadTools } from "./tools/registry.ts";
+import { GitChangeBackend } from "./workspace_change_backend.ts";
+import {
+  previewGitCheckpointRollback,
+  rollbackGitWorkspaceToCheckpoint,
+} from "./workspace_rollback.ts";
 
 export type CliArguments = {
   workspace: string;
@@ -219,20 +230,52 @@ export async function runCli(): Promise<void> {
       throw new Error("当前没有活动会话，请先使用 /resume 恢复会话");
     }
 
+    const sessionStore = await requireStore();
+    const checkpointSelection = await selectRecoveryCheckpoint(
+      sessionStore.listRecoveryCheckpoints(activeSessionId, turnId),
+      {
+        ask: (prompt) => terminal.question(prompt),
+        write: console.log,
+      },
+    );
+    if (checkpointSelection.cancelled) {
+      console.log("已取消恢复，当前会话未修改。");
+      return;
+    }
+    const checkpointId = checkpointSelection.checkpointId;
+    const workspaceCheck = await sessionStore.checkTurnRecoveryWorkspace(
+      activeSessionId,
+      turnId,
+      checkpointId,
+    );
+    const workspaceChanges = await sessionStore.listTurnWorkspaceChanges(turnId);
+    await showWorkspaceChangesInteractive(workspaceChanges, {
+      ask: (prompt) => terminal.question(prompt),
+      write: console.warn,
+    });
+    const recoveryConfirmed = await confirmUnsafeRecovery(workspaceCheck, {
+      ask: (prompt) => terminal.question(prompt),
+      write: console.warn,
+    });
+    if (!recoveryConfirmed) {
+      console.log("已取消恢复，当前会话未修改。");
+      return;
+    }
+
     const recovery = prepareTurnRecovery(
-      await requireStore(),
+      sessionStore,
       activeSessionId,
       mode,
       turnId,
       sessionInput,
+      checkpointId,
     );
-    await activateSession(recovery);
-
     if (mode === "continue") {
       const nextInput = (await terminal.question("请输入继续指令: ")).trim();
       if (nextInput.length === 0) {
         throw new Error("继续指令不能为空，原活动会话未被修改");
       }
+      await activateSession(recovery);
       await executeInput(nextInput);
       return;
     }
@@ -240,7 +283,49 @@ export async function runCli(): Promise<void> {
     if (recovery.retryInput === undefined) {
       throw new Error(`Turn ${turnId} 没有可重试的原始用户目标`);
     }
+    await activateSession(recovery);
     await executeInput(recovery.retryInput);
+  }
+
+  async function rollbackTurn(turnId: string): Promise<void> {
+    if (activeSessionId === undefined) {
+      throw new Error("当前没有活动会话，请先使用 /resume 恢复会话");
+    }
+    const sessionStore = await requireStore();
+    const selected = await selectRecoveryCheckpoint(
+      sessionStore.listRecoveryCheckpoints(activeSessionId, turnId),
+      {
+        ask: (prompt) => terminal.question(prompt),
+        write: console.log,
+      },
+    );
+    if (selected.cancelled || selected.checkpointId === undefined) {
+      console.log("已取消回滚，当前工作区未修改。");
+      return;
+    }
+    const target = sessionStore.getCheckpointWorkspaceTarget(
+      activeSessionId,
+      turnId,
+      selected.checkpointId,
+    );
+    if (target.kind !== "git") throw new Error("仅支持 Git 工作区检查点回滚");
+    const backend = await GitChangeBackend.discover(workspacePath);
+    const current = await backend.captureBaseline();
+    if (current.kind !== "git") throw new Error("当前工作区无法建立 Git 基线");
+    const changes = await previewGitCheckpointRollback(current, target);
+    await showWorkspaceChangesInteractive(changes, {
+      ask: async () => "",
+      write: console.warn,
+    });
+    if (!await confirmCheckpointRollback({
+      ask: (prompt) => terminal.question(prompt),
+      write: console.warn,
+    })) {
+      console.log("已取消回滚，当前工作区未修改。");
+      return;
+    }
+    await rollbackGitWorkspaceToCheckpoint(current, target);
+    console.log(`已回滚到检查点 ${selected.checkpointId}。`);
   }
 
   try {
@@ -265,7 +350,7 @@ export async function runCli(): Promise<void> {
             "/sessions 列出会话 | /new [标题] 新建会话 | " +
               "/resume [session-id] 恢复会话 | /switch <session-id> " +
               "切换会话 | /continue <turn-id> 继续 | " +
-              "/retry <turn-id> 重试 | /exit 退出",
+              "/retry <turn-id> 重试 | /rollback <turn-id> 回滚检查点 | /exit 退出",
           );
           return;
         }
@@ -332,6 +417,10 @@ export async function runCli(): Promise<void> {
         }
         if (command.type === "retry-turn") {
           await recoverTurn("retry", command.turnId);
+          return;
+        }
+        if (command.type === "rollback-turn") {
+          await rollbackTurn(command.turnId);
         }
       },
       onError: (error) => {

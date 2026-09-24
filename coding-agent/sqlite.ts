@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-export const CURRENT_SCHEMA_VERSION = 3;
+export const CURRENT_SCHEMA_VERSION = 7;
 export const STATE_DIRECTORY_MODE = 0o700;
 export const STATE_DATABASE_MODE = 0o600;
 
@@ -263,6 +263,61 @@ const MIGRATIONS: Migration[] = [
       END;
     `,
   },
+  {
+    version: 4,
+    sql: `
+      CREATE TABLE file_change_events (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        checkpoint_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL,
+        operation TEXT NOT NULL
+          CHECK (operation IN ('create', 'modify', 'delete')),
+        path TEXT NOT NULL,
+        before_exists INTEGER NOT NULL
+          CHECK (before_exists IN (0, 1)),
+        before_sha256 TEXT,
+        after_exists INTEGER NOT NULL
+          CHECK (after_exists IN (0, 1)),
+        after_sha256 TEXT,
+        diff_hunks_json TEXT NOT NULL,
+        tool_name TEXT,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY (session_id)
+          REFERENCES sessions(id)
+          ON DELETE CASCADE,
+        FOREIGN KEY (turn_id)
+          REFERENCES turns(id)
+          ON DELETE CASCADE,
+        FOREIGN KEY (checkpoint_id)
+          REFERENCES turn_checkpoints(id)
+          ON DELETE CASCADE,
+        UNIQUE (turn_id, sequence)
+      );
+
+      CREATE INDEX file_change_events_turn_sequence_idx
+      ON file_change_events(turn_id, sequence);
+    `,
+  },
+  {
+    version: 5,
+    sql: `
+      ALTER TABLE turns ADD COLUMN workspace_baseline_json TEXT;
+    `,
+  },
+  {
+    version: 6,
+    sql: `
+      ALTER TABLE turns ADD COLUMN workspace_end_baseline_json TEXT;
+    `,
+  },
+  {
+    version: 7,
+    sql: `
+      ALTER TABLE turn_checkpoints ADD COLUMN workspace_tree_oid TEXT;
+    `,
+  },
 ];
 
 export function stateDatabasePath(): string {
@@ -367,7 +422,7 @@ function tableColumns(database: DatabaseSync, table: string): Set<string> {
 
 function schemaObjectExists(
   database: DatabaseSync,
-  type: "trigger",
+  type: "trigger" | "index",
   name: string,
 ): boolean {
   return database.prepare(`
@@ -382,11 +437,21 @@ function validateCurrentSchema(database: DatabaseSync): void {
   const turnColumns = tableColumns(database, "turns");
   const itemColumns = tableColumns(database, "items");
   const checkpointColumns = tableColumns(database, "turn_checkpoints");
+  const fileChangeEventColumns = tableColumns(database, "file_change_events");
   if (
     !sessionColumns.has("workspace_key") ||
     !turnColumns.has("termination_reason") ||
+    !turnColumns.has("workspace_baseline_json") ||
+    !turnColumns.has("workspace_end_baseline_json") ||
     !itemColumns.has("item_type") ||
     !checkpointColumns.has("through_item_sequence") ||
+    !checkpointColumns.has("workspace_tree_oid") ||
+    !fileChangeEventColumns.has("diff_hunks_json") ||
+    !schemaObjectExists(
+      database,
+      "index",
+      "file_change_events_turn_sequence_idx",
+    ) ||
     !schemaObjectExists(database, "trigger", "turns_termination_insert_guard") ||
     !schemaObjectExists(database, "trigger", "turns_termination_update_guard") ||
     !schemaObjectExists(database, "trigger", "turns_terminal_update_guard") ||

@@ -7,6 +7,7 @@ import {
   SessionStore,
   type TurnRecoveryMode,
 } from "./store.ts";
+import type { WorkspaceRecoveryCheck } from "../workspace_fingerprint.ts";
 
 export type RuntimeSessionInput = {
   model: string;
@@ -101,6 +102,7 @@ export type PreparedTurnRecovery = PreparedRuntimeSession & {
   mode: TurnRecoveryMode;
   sourceTurnId: string;
   retryInput?: string;
+  workspaceCheck?: WorkspaceRecoveryCheck;
 };
 
 export function prepareTurnRecovery(
@@ -109,6 +111,7 @@ export function prepareTurnRecovery(
   mode: TurnRecoveryMode,
   sourceTurnId: string,
   input: RuntimeSessionInput,
+  checkpointId?: string,
 ): PreparedTurnRecovery {
   const session = store.getSession(sessionId);
   if (!isCompatible(session, input)) {
@@ -117,7 +120,12 @@ export function prepareTurnRecovery(
     );
   }
 
-  const recovery = store.prepareTurnRecovery(sessionId, mode, sourceTurnId);
+  const recovery = store.prepareTurnRecovery(
+    sessionId,
+    mode,
+    sourceTurnId,
+    checkpointId,
+  );
   return {
     session,
     recorder: store.recorder(session.id),

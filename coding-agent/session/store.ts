@@ -7,6 +7,9 @@ import {
   validateCheckpointMetadata,
   type CheckpointKind,
   type CheckpointMetadata,
+  type DiffHunk,
+  type FileChangeEventInput,
+  type FileChangeOperation,
   type TurnCheckpoint,
 } from "../checkpoint.ts";
 import {
@@ -21,6 +24,15 @@ import {
   type ReplayMode,
   type ReplayResult,
 } from "../replay.ts";
+import {
+  compareWorkspaceFingerprint,
+  type WorkspaceRecoveryCheck,
+} from "../workspace_fingerprint.ts";
+import {
+  parseWorkspaceBaseline,
+  type WorkspaceBaseline,
+} from "../workspace_change_backend.ts";
+import { compareGitWorkspaceBaselines } from "../workspace_change_diff.ts";
 import {
   isTurnStatus,
   isTurnTerminationReason,
@@ -53,6 +65,8 @@ export type TurnRecord = {
   completedAt: number | null;
   error: string | null;
   terminationReason: TurnTerminationReason | null;
+  workspaceBaseline?: WorkspaceBaseline | null;
+  workspaceEndBaseline?: WorkspaceBaseline | null;
 };
 
 export type RestoredTurn = TurnRecord & {
@@ -75,6 +89,45 @@ export type CompactionRecord = {
 
 export type { TurnCheckpoint } from "../checkpoint.ts";
 
+export type FileChangeEvent = {
+  id: string;
+  sessionId: string;
+  turnId: string;
+  checkpointId: string;
+  sequence: number;
+  operation: FileChangeOperation;
+  path: string;
+  beforeExists: boolean;
+  beforeSha256: string | null;
+  afterExists: boolean;
+  afterSha256: string | null;
+  diffHunks: DiffHunk[];
+  toolName: string | null;
+  createdAt: number;
+};
+
+function toFileChangeInput(change: FileChangeEvent): FileChangeEventInput {
+  return {
+    path: change.path,
+    operation: change.operation,
+    beforeExists: change.beforeExists,
+    beforeSha256: change.beforeSha256,
+    afterExists: change.afterExists,
+    afterSha256: change.afterSha256,
+    diffHunks: change.diffHunks,
+    ...(change.toolName === null ? {} : { toolName: change.toolName }),
+  };
+}
+
+function changeKey(change: FileChangeEventInput): string {
+  return [
+    change.operation,
+    change.path,
+    change.beforeSha256 ?? "missing",
+    change.afterSha256 ?? "missing",
+  ].join("|");
+}
+
 export function restoredItems(session: RestoredSession): ResponseInputItem[] {
   const compaction = session.compaction;
   const candidateTurns = compaction === undefined
@@ -91,6 +144,7 @@ export function restoredItems(session: RestoredSession): ResponseInputItem[] {
 export type SessionReplayOptions = {
   mode?: ReplayMode;
   sourceTurnId?: string;
+  checkpointId?: string;
 };
 
 export type TurnRecoveryMode = "continue" | "retry";
@@ -99,6 +153,17 @@ export type TurnRecovery = {
   replay: ReplayResult;
   items: ResponseInputItem[];
   retryInput?: string;
+};
+
+export type RecoveryCheckpointOption = {
+  id: string;
+  sequence: number;
+  kind: CheckpointKind;
+  throughItemSequence: number;
+  responseId: string | null;
+  functionCallId: string | null;
+  workspaceFingerprint: string | null;
+  workspaceTreeOid?: string | null;
 };
 
 export type CreateSessionInput = {
@@ -176,6 +241,36 @@ function turnFromRow(value: unknown): TurnRecord {
   }
   const terminationReason = rawReason as TurnTerminationReason | null;
   validateTurnTermination(status, terminationReason);
+  const workspaceBaselineJson = nullableString(
+    data.workspace_baseline_json,
+    "turns.workspace_baseline_json",
+  );
+  let workspaceBaseline: WorkspaceBaseline | null = null;
+  if (workspaceBaselineJson !== null) {
+    try {
+      workspaceBaseline = parseWorkspaceBaseline(JSON.parse(workspaceBaselineJson));
+    } catch (error) {
+      throw new Error(
+        `数据库中的工作区基线非法: ${error instanceof Error ? error.message : error}`,
+      );
+    }
+  }
+  const workspaceEndBaselineJson = nullableString(
+    data.workspace_end_baseline_json,
+    "turns.workspace_end_baseline_json",
+  );
+  let workspaceEndBaseline: WorkspaceBaseline | null = null;
+  if (workspaceEndBaselineJson !== null) {
+    try {
+      workspaceEndBaseline = parseWorkspaceBaseline(
+        JSON.parse(workspaceEndBaselineJson),
+      );
+    } catch (error) {
+      throw new Error(
+        `数据库中的结束工作区基线非法: ${error instanceof Error ? error.message : error}`,
+      );
+    }
+  }
   return {
     id: stringValue(data.id, "turns.id"),
     sessionId: stringValue(data.session_id, "turns.session_id"),
@@ -186,6 +281,8 @@ function turnFromRow(value: unknown): TurnRecord {
     completedAt: nullableNumber(data.completed_at, "turns.completed_at"),
     error: nullableString(data.error, "turns.error"),
     terminationReason,
+    workspaceBaseline,
+    workspaceEndBaseline,
   };
 }
 
@@ -227,7 +324,49 @@ function checkpointFromRow(value: unknown): TurnCheckpoint {
       data.workspace_fingerprint,
       "turn_checkpoints.workspace_fingerprint",
     ),
+    workspaceTreeOid: nullableString(
+      data.workspace_tree_oid,
+      "turn_checkpoints.workspace_tree_oid",
+    ),
     createdAt: numberValue(data.created_at, "turn_checkpoints.created_at"),
+  };
+}
+
+function fileChangeEventFromRow(value: unknown): FileChangeEvent {
+  const data = row(value);
+  const operation = stringValue(data.operation, "file_change_events.operation");
+  if (operation !== "create" && operation !== "modify" && operation !== "delete") {
+    throw new Error(`数据库中的文件变更操作类型非法: ${operation}`);
+  }
+  const diffHunksValue = stringValue(
+    data.diff_hunks_json,
+    "file_change_events.diff_hunks_json",
+  );
+  let diffHunks: DiffHunk[];
+  try {
+    const parsed: unknown = JSON.parse(diffHunksValue);
+    if (!Array.isArray(parsed)) throw new Error("不是数组");
+    diffHunks = parsed as DiffHunk[];
+  } catch (error) {
+    throw new Error(
+      `数据库中的文件变更 diff hunk 非法: ${error instanceof Error ? error.message : error}`,
+    );
+  }
+  return {
+    id: stringValue(data.id, "file_change_events.id"),
+    sessionId: stringValue(data.session_id, "file_change_events.session_id"),
+    turnId: stringValue(data.turn_id, "file_change_events.turn_id"),
+    checkpointId: stringValue(data.checkpoint_id, "file_change_events.checkpoint_id"),
+    sequence: numberValue(data.sequence, "file_change_events.sequence"),
+    operation,
+    path: stringValue(data.path, "file_change_events.path"),
+    beforeExists: numberValue(data.before_exists, "file_change_events.before_exists") === 1,
+    beforeSha256: nullableString(data.before_sha256, "file_change_events.before_sha256"),
+    afterExists: numberValue(data.after_exists, "file_change_events.after_exists") === 1,
+    afterSha256: nullableString(data.after_sha256, "file_change_events.after_sha256"),
+    diffHunks,
+    toolName: nullableString(data.tool_name, "file_change_events.tool_name"),
+    createdAt: numberValue(data.created_at, "file_change_events.created_at"),
   };
 }
 
@@ -361,7 +500,11 @@ export class SessionStore {
     return this.requireSessionForWorkspace(sessionId);
   }
 
-  startTurn(sessionId: string, userInput: string): string {
+  startTurn(
+    sessionId: string,
+    userInput: string,
+    workspaceBaseline?: WorkspaceBaseline,
+  ): string {
     return this.transaction(() => {
       this.requireSessionForWorkspace(sessionId);
       const turnId = this.createId();
@@ -369,9 +512,19 @@ export class SessionStore {
       const sequence = this.nextTurnSequence(sessionId);
       this.database.prepare(`
         INSERT INTO turns
-          (id, session_id, sequence, user_input, status, started_at)
-        VALUES (?, ?, ?, ?, 'running', ?)
-      `).run(turnId, sessionId, sequence, userInput, timestamp);
+          (id, session_id, sequence, user_input, status, started_at,
+           workspace_baseline_json)
+        VALUES (?, ?, ?, ?, 'running', ?, ?)
+      `).run(
+        turnId,
+        sessionId,
+        sequence,
+        userInput,
+        timestamp,
+        workspaceBaseline === undefined
+          ? null
+          : JSON.stringify(workspaceBaseline),
+      );
       this.insertItem(
         sessionId,
         turnId,
@@ -427,23 +580,101 @@ export class SessionStore {
     `).all(turnId).map(checkpointFromRow);
   }
 
-  completeTurn(turnId: string): void {
-    this.finishTurn(turnId, "completed", null, null);
+  listTurnFileChanges(turnId: string): FileChangeEvent[] {
+    const turn = this.requireRunningOrFinishedTurn(turnId);
+    this.requireSessionForWorkspace(turn.sessionId);
+    return this.database.prepare(`
+      SELECT *
+      FROM file_change_events
+      WHERE turn_id = ?
+      ORDER BY sequence ASC
+    `).all(turnId).map(fileChangeEventFromRow);
+  }
+
+  async listTurnWorkspaceChanges(
+    turnId: string,
+  ): Promise<FileChangeEventInput[]> {
+    const turn = this.requireRunningOrFinishedTurn(turnId);
+    this.requireSessionForWorkspace(turn.sessionId);
+    const recordedChanges = this.listTurnFileChanges(turnId);
+    const start = turn.workspaceBaseline;
+    const end = turn.workspaceEndBaseline;
+    if (
+      start?.kind !== "git" ||
+      end?.kind !== "git"
+    ) {
+      return recordedChanges.map(toFileChangeInput);
+    }
+    const workspaceChanges = await compareGitWorkspaceBaselines(start, end);
+    const merged = [...recordedChanges.map(toFileChangeInput)];
+    const known = new Set(merged.map(changeKey));
+    for (const change of workspaceChanges) {
+      if (known.has(changeKey(change))) continue;
+      known.add(changeKey(change));
+      merged.push(change);
+    }
+    return merged;
+  }
+
+  getCheckpointWorkspaceTarget(
+    sessionId: string,
+    turnId: string,
+    checkpointId: string,
+  ): WorkspaceBaseline {
+    const turn = this.requireRunningOrFinishedTurn(turnId);
+    if (turn.sessionId !== sessionId) {
+      throw new Error(`Turn ${turnId} 不属于 Session ${sessionId}`);
+    }
+    const checkpoint = this.listTurnCheckpoints(turnId).find(
+      (item) => item.id === checkpointId,
+    );
+    if (checkpoint === undefined) throw new Error(`找不到检查点: ${checkpointId}`);
+    if (
+      checkpoint.workspaceTreeOid === null ||
+      turn.workspaceBaseline?.kind !== "git"
+    ) {
+      throw new Error("该检查点没有可回滚的 Git 工作区 Tree");
+    }
+    return {
+      ...turn.workspaceBaseline,
+      treeOid: checkpoint.workspaceTreeOid,
+    };
+  }
+
+  completeTurn(turnId: string, workspaceEndBaseline?: WorkspaceBaseline): void {
+    this.finishTurn(turnId, "completed", null, null, workspaceEndBaseline);
   }
 
   failTurn(
     turnId: string,
     error: unknown,
     reason: TurnFailureReason,
+    workspaceEndBaseline?: WorkspaceBaseline,
   ): void {
-    this.finishTurn(turnId, "failed", errorText(error), reason);
+    this.finishTurn(
+      turnId,
+      "failed",
+      errorText(error),
+      reason,
+      workspaceEndBaseline,
+    );
   }
 
-  interruptTurn(turnId: string, reason: TurnInterruptionReason): void {
+  interruptTurn(
+    turnId: string,
+    reason: TurnInterruptionReason,
+    workspaceEndBaseline?: WorkspaceBaseline,
+  ): void {
     const message = reason === "user_cancelled"
       ? "用户取消了当前 Turn"
       : "进程在 Turn 完成前结束";
-    this.finishTurn(turnId, "interrupted", message, reason);
+    this.finishTurn(
+      turnId,
+      "interrupted",
+      message,
+      reason,
+      workspaceEndBaseline,
+    );
   }
 
   restoreSession(sessionId: string): RestoredSession {
@@ -510,6 +741,9 @@ export class SessionStore {
       ...(options.sourceTurnId === undefined
         ? {}
         : { sourceTurnId: options.sourceTurnId }),
+      ...(options.checkpointId === undefined
+        ? {}
+        : { checkpointId: options.checkpointId }),
     });
   }
 
@@ -541,6 +775,7 @@ export class SessionStore {
     sessionId: string,
     mode: TurnRecoveryMode,
     sourceTurnId: string,
+    checkpointId?: string,
   ): TurnRecovery {
     const sourceTurn = this.requireRunningOrFinishedTurn(sourceTurnId);
     if (sourceTurn.sessionId !== sessionId) {
@@ -562,6 +797,7 @@ export class SessionStore {
       mode,
       turns: candidateTurns,
       sourceTurnId,
+      ...(checkpointId === undefined ? {} : { checkpointId }),
     });
 
     if (replay.source?.turnId !== sourceTurnId) {
@@ -584,6 +820,58 @@ export class SessionStore {
         ? {}
         : { retryInput: replay.retryInput }),
     };
+  }
+
+  async checkTurnRecoveryWorkspace(
+    sessionId: string,
+    sourceTurnId: string,
+    checkpointId?: string,
+  ): Promise<WorkspaceRecoveryCheck> {
+    const sourceTurn = this.requireRunningOrFinishedTurn(sourceTurnId);
+    if (sourceTurn.sessionId !== sessionId) {
+      throw new Error(`Turn ${sourceTurnId} 不属于 Session ${sessionId}`);
+    }
+    if (sourceTurn.status !== "failed" && sourceTurn.status !== "interrupted") {
+      throw new Error(
+        `Turn ${sourceTurnId} 不是可恢复的 failed 或 interrupted Turn`,
+      );
+    }
+    const checkpoints = this.listTurnCheckpoints(sourceTurnId);
+    const checkpoint = checkpointId === undefined
+      ? [...checkpoints].reverse().find((item) => item.workspaceFingerprint !== null)
+      : checkpoints.find((item) => item.id === checkpointId);
+    if (checkpointId !== undefined && checkpoint === undefined) {
+      throw new Error(`找不到检查点: ${checkpointId}`);
+    }
+    return compareWorkspaceFingerprint(
+      checkpoint?.workspaceFingerprint,
+      checkpoint?.id,
+    );
+  }
+
+  listRecoveryCheckpoints(
+    sessionId: string,
+    sourceTurnId: string,
+  ): RecoveryCheckpointOption[] {
+    const sourceTurn = this.requireRunningOrFinishedTurn(sourceTurnId);
+    if (sourceTurn.sessionId !== sessionId) {
+      throw new Error(`Turn ${sourceTurnId} 不属于 Session ${sessionId}`);
+    }
+    if (sourceTurn.status !== "failed" && sourceTurn.status !== "interrupted") {
+      throw new Error(
+        `Turn ${sourceTurnId} 不是可恢复的 failed 或 interrupted Turn`,
+      );
+    }
+    return this.listTurnCheckpoints(sourceTurnId).map((checkpoint) => ({
+      id: checkpoint.id,
+      sequence: checkpoint.sequence,
+      kind: checkpoint.kind,
+      throughItemSequence: checkpoint.throughItemSequence,
+      responseId: checkpoint.responseId,
+        functionCallId: checkpoint.functionCallId,
+        workspaceFingerprint: checkpoint.workspaceFingerprint,
+        workspaceTreeOid: checkpoint.workspaceTreeOid,
+      }));
   }
 
   prepareCompaction(
@@ -666,7 +954,9 @@ export class SessionStore {
   recorder(sessionId: string): SessionRecorder {
     this.requireSessionForWorkspace(sessionId);
     return {
-      startTurn: async (userInput) => this.startTurn(sessionId, userInput),
+      startTurn: async (userInput, workspaceBaseline) => {
+        return this.startTurn(sessionId, userInput, workspaceBaseline);
+      },
       appendItem: async (turnId, item) => this.appendItem(turnId, item),
       appendModelResponse: async (turnId, items, metadata) => {
         this.appendModelResponse(turnId, items, metadata);
@@ -674,12 +964,14 @@ export class SessionStore {
       appendToolResult: async (turnId, item, metadata) => {
         this.appendToolResult(turnId, item, metadata);
       },
-      completeTurn: async (turnId) => this.completeTurn(turnId),
-      failTurn: async (turnId, error, reason) => {
-        this.failTurn(turnId, error, reason);
+      completeTurn: async (turnId, workspaceEndBaseline) => {
+        this.completeTurn(turnId, workspaceEndBaseline);
       },
-      interruptTurn: async (turnId, reason) => {
-        this.interruptTurn(turnId, reason);
+      failTurn: async (turnId, error, reason, workspaceEndBaseline) => {
+        this.failTurn(turnId, error, reason, workspaceEndBaseline);
+      },
+      interruptTurn: async (turnId, reason, workspaceEndBaseline) => {
+        this.interruptTurn(turnId, reason, workspaceEndBaseline);
       },
       buildTurnReplay: async (turnId, mode) => {
         return this.buildTurnReplay(turnId, mode);
@@ -719,7 +1011,8 @@ export class SessionStore {
     turnId: string,
   ): ReplayCheckpoint[] {
     return this.database.prepare(`
-      SELECT kind, through_item_sequence
+      SELECT id, sequence, kind, through_item_sequence,
+             workspace_fingerprint, workspace_tree_oid
       FROM turn_checkpoints
       WHERE session_id = ? AND turn_id = ?
       ORDER BY sequence ASC
@@ -739,8 +1032,18 @@ export class SessionStore {
         WHERE session_id = ? AND turn_id = ? AND sequence <= ?
       `).get(sessionId, turnId, throughItemSequence)).count;
       return {
+        id: stringValue(checkpoint.id, "turn_checkpoints.id"),
+        sequence: numberValue(checkpoint.sequence, "turn_checkpoints.sequence"),
         kind,
         throughItemCount: numberValue(count, "turn_checkpoints.item_count"),
+        workspaceFingerprint: nullableString(
+          checkpoint.workspace_fingerprint,
+          "turn_checkpoints.workspace_fingerprint",
+        ),
+        workspaceTreeOid: nullableString(
+          checkpoint.workspace_tree_oid,
+          "turn_checkpoints.workspace_tree_oid",
+        ),
       };
     });
   }
@@ -802,6 +1105,15 @@ export class SessionStore {
     return numberValue(result.next_sequence, "turn_checkpoints.next_sequence");
   }
 
+  private nextFileChangeSequence(turnId: string): number {
+    const result = row(this.database.prepare(`
+      SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence
+      FROM file_change_events
+      WHERE turn_id = ?
+    `).get(turnId));
+    return numberValue(result.next_sequence, "file_change_events.next_sequence");
+  }
+
   private appendItemsWithCheckpoint(
     turnId: string,
     items: ResponseInputItem[],
@@ -842,13 +1154,15 @@ export class SessionStore {
           timestamp,
         );
       }
+      const checkpointId = this.createId();
       this.database.prepare(`
         INSERT INTO turn_checkpoints
           (id, session_id, turn_id, sequence, kind, through_item_sequence,
-           response_id, function_call_id, workspace_fingerprint, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           response_id, function_call_id, workspace_fingerprint,
+           workspace_tree_oid, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
-        this.createId(),
+        checkpointId,
         turn.sessionId,
         turnId,
         this.nextCheckpointSequence(turnId),
@@ -857,10 +1171,51 @@ export class SessionStore {
         metadata.responseId ?? null,
         metadata.functionCallId ?? null,
         metadata.workspaceFingerprint ?? null,
+        metadata.workspaceTreeOid ?? null,
+        timestamp,
+      );
+      this.insertFileChangeEvents(
+        turn.sessionId,
+        turnId,
+        checkpointId,
+        metadata.fileChanges ?? [],
         timestamp,
       );
       this.touchSession(turn.sessionId, timestamp);
     });
+  }
+
+  private insertFileChangeEvents(
+    sessionId: string,
+    turnId: string,
+    checkpointId: string,
+    events: FileChangeEventInput[],
+    timestamp: number,
+  ): void {
+    for (const event of events) {
+      this.database.prepare(`
+        INSERT INTO file_change_events
+          (id, session_id, turn_id, checkpoint_id, sequence, operation, path,
+           before_exists, before_sha256, after_exists, after_sha256,
+           diff_hunks_json, tool_name, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        this.createId(),
+        sessionId,
+        turnId,
+        checkpointId,
+        this.nextFileChangeSequence(turnId),
+        event.operation,
+        event.path,
+        event.beforeExists ? 1 : 0,
+        event.beforeSha256,
+        event.afterExists ? 1 : 0,
+        event.afterSha256,
+        JSON.stringify(event.diffHunks),
+        event.toolName ?? null,
+        timestamp,
+      );
+    }
   }
 
   private requireFunctionCallOutputPair(
@@ -953,6 +1308,7 @@ export class SessionStore {
     status: "completed" | "failed" | "interrupted",
     error: string | null,
     terminationReason: TurnTerminationReason | null,
+    workspaceEndBaseline?: WorkspaceBaseline,
   ): void {
     validateTurnTermination(status, terminationReason);
     this.transaction(() => {
@@ -961,9 +1317,19 @@ export class SessionStore {
       const timestamp = this.now();
       this.database.prepare(`
         UPDATE turns
-        SET status = ?, completed_at = ?, error = ?, termination_reason = ?
+        SET status = ?, completed_at = ?, error = ?, termination_reason = ?,
+            workspace_end_baseline_json = ?
         WHERE id = ?
-      `).run(status, timestamp, error, terminationReason, turnId);
+      `).run(
+        status,
+        timestamp,
+        error,
+        terminationReason,
+        workspaceEndBaseline === undefined
+          ? null
+          : JSON.stringify(workspaceEndBaseline),
+        turnId,
+      );
       this.touchSession(turn.sessionId, timestamp);
     });
   }

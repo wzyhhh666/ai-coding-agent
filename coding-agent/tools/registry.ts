@@ -7,6 +7,13 @@ import type { ErrorObject, ValidateFunction } from "ajv";
 
 import { FileChangeTracker } from "../file_change_tracker.ts";
 import type { FileChange, FileChangeCapture } from "../file_change_tracker.ts";
+import type { FileChangeEventInput } from "../checkpoint.ts";
+import {
+  createWorkspaceChangeBackend,
+  type WorkspaceBaseline,
+  type WorkspaceChangeBackend,
+} from "../workspace_change_backend.ts";
+import { getWorkspaceRoot } from "./_common.ts";
 import { PermissionEngine } from "./permissions.ts";
 import type { ApprovalPrompt, PermissionAction } from "./permissions.ts";
 
@@ -32,6 +39,10 @@ export type ResponseToolSpec = {
   description?: string;
   parameters: Record<string, unknown>;
   strict: false;
+};
+
+export type ToolRegistryOptions = {
+  workspaceBackend?: WorkspaceChangeBackend;
 };
 
 export function toResponseTools(specs: ToolSpec[]): ResponseToolSpec[] {
@@ -80,12 +91,19 @@ function addFileChange(result: unknown, change: FileChange): unknown {
   return { result, file_change: change };
 }
 
+function addTrackingUnavailable(result: unknown): unknown {
+  if (result !== null && typeof result === "object" && !Array.isArray(result)) {
+    return { ...result, change_tracking: "unavailable" };
+  }
+  return { result, change_tracking: "unavailable" };
+}
+
 export class ToolRegistry {
   readonly specs: ToolSpec[];
   private readonly handlers: Record<string, ToolHandler>;
   private readonly validators = new Map<string, ValidateFunction>();
   private readonly permissions: PermissionEngine;
-  private readonly fileChanges = new FileChangeTracker();
+  private readonly fileChanges: FileChangeTracker;
 
   constructor(
     specs: ToolSpec[],
@@ -93,10 +111,12 @@ export class ToolRegistry {
     permissions = new PermissionEngine(
       Object.fromEntries(specs.map((spec) => [spec.function.name, "allow"])),
     ),
+    options: ToolRegistryOptions = {},
   ) {
     this.specs = specs;
     this.handlers = handlers;
     this.permissions = permissions;
+    this.fileChanges = new FileChangeTracker(options);
     const ajv = new Ajv({
       allErrors: true,
       coerceTypes: false,
@@ -127,12 +147,24 @@ export class ToolRegistry {
     this.fileChanges.beginTurn();
   }
 
+  async captureWorkspaceBaseline(): Promise<WorkspaceBaseline> {
+    return this.fileChanges.captureWorkspaceBaseline();
+  }
+
+  workspaceBaseline(): WorkspaceBaseline | undefined {
+    return this.fileChanges.workspaceBaseline();
+  }
+
   finishTurn(): FileChange[] {
     return this.fileChanges.finishTurn();
   }
 
   workspaceFingerprint(): string | undefined {
     return this.fileChanges.workspaceFingerprint();
+  }
+
+  takeFileChangeEvents(): FileChangeEventInput[] {
+    return this.fileChanges.takeFileChangeEvents();
   }
 
   async execute(name: string, rawArguments: string): Promise<string> {
@@ -179,16 +211,30 @@ export class ToolRegistry {
         capture = await this.fileChanges.captureBefore(String(toolArguments.path ?? ""));
       }
 
-      const result = await handler(toolArguments);
+      const result = name === "run_command"
+        ? await this.fileChanges.runWithWorkspaceTracking(
+          name,
+          () => Promise.resolve(handler(toolArguments)),
+        )
+        : await handler(toolArguments);
+      const commandResult = name === "run_command" &&
+          result !== null && typeof result === "object" &&
+          "result" in result && "trackingUnavailable" in result
+        ? result as { result: unknown; trackingUnavailable: boolean }
+        : undefined;
+      const toolResult = commandResult?.result ?? result;
       const change = capture === undefined
         ? undefined
-        : await this.fileChanges.captureAfter(capture);
+        : await this.fileChanges.captureAfter(capture, name);
       const observation = change === undefined
-        ? result
-        : addFileChange(result, change);
-      return typeof observation === "string"
-        ? observation
-        : JSON.stringify(observation);
+        ? toolResult
+        : addFileChange(toolResult, change);
+      const finalObservation = commandResult?.trackingUnavailable === true
+        ? addTrackingUnavailable(observation)
+        : observation;
+      return typeof finalObservation === "string"
+        ? finalObservation
+        : JSON.stringify(finalObservation);
     } catch (error) {
       return error instanceof SyntaxError
         ? `参数不是合法 JSON: ${rawArguments}`
@@ -201,13 +247,18 @@ export async function loadTools(
   root = BASE_DIR,
   approvalPrompt?: ApprovalPrompt,
 ): Promise<ToolRegistry> {
+  const workspaceBackend = await createWorkspaceChangeBackend(
+    root === BASE_DIR ? getWorkspaceRoot() : root,
+  );
   const configFile = path.join(root, "config", "tools.json");
   let configuration: Record<string, unknown> = {};
   try {
     configuration = record(JSON.parse(await readFile(configFile, "utf8")));
   } catch (error) {
     if (error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT") {
-      return new ToolRegistry([], {}, new PermissionEngine({}));
+      return new ToolRegistry([], {}, new PermissionEngine({}), {
+        workspaceBackend,
+      });
     }
     throw new Error(
       `无法读取工具配置 ${configFile}: ${error instanceof Error ? error.message : error}`,
@@ -273,5 +324,6 @@ export async function loadTools(
     specs,
     handlers,
     new PermissionEngine(policies, approvalPrompt),
+    { workspaceBackend },
   );
 }

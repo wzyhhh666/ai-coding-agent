@@ -7,6 +7,7 @@ import test from "node:test";
 
 import { restoredItems, SessionStore } from "../../session/store.ts";
 import { initializeStateDatabase } from "../../sqlite.ts";
+import type { WorkspaceBaseline } from "../../workspace_change_backend.ts";
 
 type TestContext = {
   database: DatabaseSync;
@@ -86,7 +87,7 @@ test("SessionStore 按更新时间列出当前工作区会话并限制数量", a
   const context = await createTestContext();
   try {
     const store = new SessionStore(context.database, "./workspace", {
-      now: values([1, 2, 3]),
+      now: values([1, 2, 3, 4]),
       createId: values(["session-1", "session-2", "session-3"]),
     });
     store.createSession({ title: "first" });
@@ -322,6 +323,40 @@ test("SessionRecorder 适配器代理 SessionStore 生命周期操作", async ()
   }
 });
 
+test("SessionStore 持久化 Turn 开始时的工作区基线", async () => {
+  const context = await createTestContext();
+  try {
+    const store = new SessionStore(context.database, "./workspace", {
+      now: values([1, 2, 3, 4]),
+      createId: values(["session-1", "turn-1"]),
+    });
+    const session = store.createSession();
+    const baseline: WorkspaceBaseline = {
+      kind: "git",
+      repositoryRoot: "C:/repo",
+      workspacePrefix: "coding-agent",
+      headOid: "a".repeat(40),
+      indexTreeOid: "a".repeat(40),
+      treeOid: "b".repeat(40),
+      objectFormat: "sha1",
+    };
+    const turnId = store.startTurn(session.id, "记录基线", baseline);
+    const endBaseline: WorkspaceBaseline = {
+      ...baseline,
+      treeOid: "c".repeat(40),
+    };
+    store.completeTurn(turnId, endBaseline);
+    const restored = store.restoreSession(session.id);
+    assert.deepEqual(restored.turns.find((turn) => turn.id === turnId)?.workspaceBaseline, baseline);
+    assert.deepEqual(
+      restored.turns.find((turn) => turn.id === turnId)?.workspaceEndBaseline,
+      endBaseline,
+    );
+  } finally {
+    await closeTestContext(context);
+  }
+});
+
 test("SessionRecorder 将用户取消记录为 interrupted", async () => {
   const context = await createTestContext();
   try {
@@ -358,6 +393,7 @@ test("SessionStore 原子保存模型 Response 和工具结果检查点", async 
         "turn-1",
         "checkpoint-model",
         "checkpoint-tool",
+        "file-change-1",
       ]),
     });
     const session = store.createSession();
@@ -373,7 +409,53 @@ test("SessionStore 原子保存模型 Response 和工具结果检查点", async 
       type: "function_call_output",
       call_id: "call-1",
       output: "content",
-    }, { functionCallId: "call-1", workspaceFingerprint: "fp-1" });
+    }, {
+      functionCallId: "call-1",
+      workspaceFingerprint: "fp-1",
+      fileChanges: [{
+        path: "README.md",
+        operation: "modify",
+        beforeExists: true,
+        beforeSha256: "a".repeat(64),
+        afterExists: true,
+        afterSha256: "b".repeat(64),
+        diffHunks: [{
+          oldStart: 1,
+          oldCount: 1,
+          newStart: 1,
+          newCount: 1,
+          lines: ["-old", "+new"],
+        }],
+        toolName: "edit_file",
+      }],
+    });
+
+    const fileChanges = store.listTurnFileChanges(turnId);
+    assert.deepEqual(fileChanges.map((change) => ({
+      path: change.path,
+      checkpointId: change.checkpointId,
+      sequence: change.sequence,
+      operation: change.operation,
+      toolName: change.toolName,
+      beforeSha256: change.beforeSha256,
+      afterSha256: change.afterSha256,
+      diffHunks: change.diffHunks,
+    })), [{
+      path: "README.md",
+      checkpointId: "checkpoint-tool",
+      sequence: 1,
+      operation: "modify",
+      toolName: "edit_file",
+      beforeSha256: "a".repeat(64),
+      afterSha256: "b".repeat(64),
+      diffHunks: [{
+        oldStart: 1,
+        oldCount: 1,
+        newStart: 1,
+        newCount: 1,
+        lines: ["-old", "+new"],
+      }],
+    }]);
 
     const checkpoints = store.listTurnCheckpoints(turnId);
     assert.equal(checkpoints.length, 2);
@@ -601,6 +683,80 @@ test("SessionStore 为 continue 和 retry 提供安全恢复上下文", async ()
       ).get(session.id) as { count: number }).count,
       2,
     );
+  } finally {
+    await closeTestContext(context);
+  }
+});
+
+test("SessionStore 检查恢复来源 Turn 的工作区指纹", async () => {
+  const context = await createTestContext();
+  try {
+    const store = new SessionStore(context.database, "./workspace", {
+      now: values([1, 2, 3, 4, 5, 6]),
+      createId: values(["session-1", "turn-1", "checkpoint-model", "checkpoint-tool"]),
+    });
+    const session = store.createSession();
+    const turnId = store.startTurn(session.id, "检查工作区");
+    store.appendModelResponse(turnId, [{
+      type: "function_call",
+      call_id: "call-1",
+      name: "read_file",
+      arguments: '{"path":"README.md"}',
+    }], { responseId: "response-1" });
+    store.appendToolResult(turnId, {
+      type: "function_call_output",
+      call_id: "call-1",
+      output: "content",
+    }, {
+      functionCallId: "call-1",
+      workspaceFingerprint: "not-json",
+    });
+    store.failTurn(turnId, new Error("failed"), "provider_error");
+
+    const check = await store.checkTurnRecoveryWorkspace(session.id, turnId);
+    assert.equal(check.status, "unavailable");
+    assert.equal(check.checkpointId, "checkpoint-tool");
+  } finally {
+    await closeTestContext(context);
+  }
+});
+
+test("SessionStore 列出恢复检查点并支持指定检查点", async () => {
+  const context = await createTestContext();
+  try {
+    const store = new SessionStore(context.database, "./workspace", {
+      now: values([1, 2, 3, 4, 5, 6]),
+      createId: values(["session-1", "turn-1", "checkpoint-model", "checkpoint-tool"]),
+    });
+    const session = store.createSession();
+    const turnId = store.startTurn(session.id, "选择检查点");
+    store.appendModelResponse(turnId, [{
+      type: "function_call",
+      call_id: "call-1",
+      name: "read_file",
+      arguments: '{"path":"README.md"}',
+    }], { responseId: "response-1" });
+    store.appendToolResult(turnId, {
+      type: "function_call_output",
+      call_id: "call-1",
+      output: "content",
+    }, { functionCallId: "call-1", workspaceFingerprint: "not-json" });
+    store.failTurn(turnId, new Error("failed"), "provider_error");
+
+    const options = store.listRecoveryCheckpoints(session.id, turnId);
+    assert.deepEqual(options.map((item) => item.id), [
+      "checkpoint-model",
+      "checkpoint-tool",
+    ]);
+    const recovery = store.prepareTurnRecovery(
+      session.id,
+      "continue",
+      turnId,
+      "checkpoint-model",
+    );
+    assert.deepEqual(recovery.items, [
+      { type: "message", role: "user", content: "选择检查点" },
+    ]);
   } finally {
     await closeTestContext(context);
   }

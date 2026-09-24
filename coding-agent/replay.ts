@@ -3,8 +3,11 @@ import type { CheckpointKind } from "./checkpoint.ts";
 import type { TurnStatus } from "./turn_lifecycle.ts";
 
 export type ReplayCheckpoint = {
+  id?: string;
+  sequence?: number;
   kind: CheckpointKind;
   throughItemCount: number;
+  workspaceFingerprint?: string | null;
 };
 
 /** Replay Builder 接收的最小审计 Turn 结构，不依赖数据库实现。 */
@@ -23,6 +26,7 @@ export type ReplayRequest = {
   turns: readonly ReplayTurn[];
   mode?: ReplayMode;
   sourceTurnId?: string;
+  checkpointId?: string;
 };
 
 export type ReplayWarningCode =
@@ -299,8 +303,24 @@ function checkpointItemLimit(turn: ReplayTurn): number | undefined {
   return Math.min(lastCheckpoint.throughItemCount, turn.items.length);
 }
 
-function analysisTurn(turn: ReplayTurn): ReplayTurn {
-  const itemLimit = checkpointItemLimit(turn);
+function selectedCheckpointItemLimit(
+  turn: ReplayTurn,
+  checkpointId: string | undefined,
+): number | undefined {
+  if (checkpointId === undefined) return undefined;
+  const checkpoint = turn.checkpoints?.find((item) => item.id === checkpointId);
+  if (checkpoint === undefined) {
+    throw new Error(`找不到检查点: ${checkpointId}`);
+  }
+  return checkpoint.throughItemCount;
+}
+
+function analysisTurn(
+  turn: ReplayTurn,
+  checkpointId?: string,
+): ReplayTurn {
+  const selectedLimit = selectedCheckpointItemLimit(turn, checkpointId);
+  const itemLimit = selectedLimit ?? checkpointItemLimit(turn);
   if (itemLimit === undefined || itemLimit >= turn.items.length) return turn;
   return {
     ...turn,
@@ -344,7 +364,14 @@ function filteredTerminalItems(
       "incomplete_terminal_turn",
       "失败或中断 Turn 没有可证明完整的 function_call/function_call_output 对",
     ));
-    return [];
+    return analysis.items
+      .filter((item) => {
+        return item.index < analysis.firstUnsafeIndex &&
+          item.kind !== "function_call" &&
+          item.kind !== "function_call_output" &&
+          !analysis.unsafeIndexes.has(item.index);
+      })
+      .map((item) => item.item);
   }
 
   const lastMatchedOutput = Math.max(...safeOutputIndexes);
@@ -436,6 +463,9 @@ export function buildReplay(request: ReplayRequest): ReplayResult {
   }
 
   for (const turn of turns) {
+    const selectedCheckpointId = turn.id === request.sourceTurnId
+      ? request.checkpointId
+      : undefined;
     if (
       mode !== "restore" &&
       sourceTurn !== undefined &&
@@ -453,7 +483,7 @@ export function buildReplay(request: ReplayRequest): ReplayResult {
       turn.id === request.sourceTurnId;
 
     if (turn.status === "completed") {
-      const analysis = analyzeTurn(analysisTurn(turn));
+      const analysis = analyzeTurn(analysisTurn(turn, selectedCheckpointId));
       warnings.push(...analysis.warnings);
       const completedItems = filteredCompletedItems(analysis);
       if (completedItems.length > 0) {
@@ -474,7 +504,7 @@ export function buildReplay(request: ReplayRequest): ReplayResult {
       mode === "follow_up" &&
       (turn.status === "failed" || turn.status === "interrupted")
     ) {
-      const analysis = analyzeTurn(analysisTurn(turn));
+      const analysis = analyzeTurn(analysisTurn(turn, selectedCheckpointId));
       warnings.push(...analysis.warnings);
       const safeItems = filteredFollowUpItems(analysis);
       if (safeItems.length > 0) {
@@ -485,7 +515,7 @@ export function buildReplay(request: ReplayRequest): ReplayResult {
     }
 
     if (isSelectedSource && (turn.status === "failed" || turn.status === "interrupted")) {
-      const analysis = analyzeTurn(analysisTurn(turn));
+      const analysis = analyzeTurn(analysisTurn(turn, selectedCheckpointId));
       warnings.push(...analysis.warnings);
       const terminalItems = filteredTerminalItems(analysis, turn.id, warnings);
       const sourceItems = mode === "continue" ? terminalItems : [];
