@@ -33,6 +33,17 @@ test("parseCliInput 区分任务、退出和会话命令", () => {
     type: "retry-turn",
     turnId: "turn-1",
   });
+  assert.deepEqual(parseCliInput("/skills"), { type: "list-skills" });
+  assert.deepEqual(parseCliInput("$code-review 检查当前改动"), {
+    type: "invoke-skill",
+    skillName: "code-review",
+    input: "检查当前改动",
+  });
+  assert.deepEqual(parseCliInput("/code-review 检查当前改动"), {
+    type: "invoke-skill",
+    skillName: "code-review",
+    input: "检查当前改动",
+  });
 });
 
 test("parseCliInput 为缺少参数和未知命令返回明确错误", () => {
@@ -41,8 +52,9 @@ test("parseCliInput 为缺少参数和未知命令返回明确错误", () => {
     message: "用法: /switch <session-id>",
   });
   assert.deepEqual(parseCliInput("/unknown"), {
-    type: "invalid",
-    message: "未知命令: /unknown",
+    type: "invoke-skill",
+    skillName: "unknown",
+    input: "",
   });
   assert.deepEqual(parseCliInput("/sessions extra"), {
     type: "invalid",

@@ -56,6 +56,36 @@ function emptyTools(): ToolRegistry {
   return new ToolRegistry([], {});
 }
 
+test("ReActRuntime 每个 Turn 动态构建 Skill 候选并仅在当前 Turn 注入显式 Skill", async () => {
+  const requests: ResponsesRequest[] = [];
+  const client: ResponsesClient = {
+    responses: {
+      async create(request) {
+        requests.push(request);
+        return response([message("done")], "done");
+      },
+    },
+  };
+  const runtime = new ReActRuntime(
+    client,
+    "test-model",
+    "base prompt",
+    runtimeConfig,
+    emptyTools(),
+    { skillContextProvider: (input) => `candidates:${input}` },
+  );
+
+  await runtime.runTurn("first", undefined, undefined, {
+    explicitSkillContext: "explicit instructions",
+  });
+  await runtime.runTurn("second");
+
+  assert.match(requests[0]?.instructions ?? "", /candidates:first/);
+  assert.match(requests[0]?.instructions ?? "", /explicit instructions/);
+  assert.match(requests[1]?.instructions ?? "", /candidates:second/);
+  assert.doesNotMatch(requests[1]?.instructions ?? "", /explicit instructions/);
+});
+
 async function* streamEvents(
   events: Array<Record<string, unknown> & { type: string }>,
 ) {

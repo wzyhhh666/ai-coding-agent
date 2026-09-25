@@ -28,7 +28,17 @@ import {
   STATE_PRIVACY_NOTICE,
 } from "./sqlite.ts";
 import { configureSandbox, configureWorkspace } from "./tools/index.ts";
-import { loadTools } from "./tools/registry.ts";
+import { loadTools, type ToolRegistry } from "./tools/registry.ts";
+import { installSkill } from "./skills/installer.ts";
+import { parseSkillSource } from "./skills/source.ts";
+import type { SkillInstallPreview } from "./skills/types.ts";
+import { SkillCatalog } from "./skills/catalog.ts";
+import { SkillLoader } from "./skills/loader.ts";
+import type { LoadedSkill } from "./skills/loader.ts";
+import { SkillAuditCollector } from "./skills/audit.ts";
+import { createSkillTools } from "./skills/tools.ts";
+import { createDraftFromTurn, installApprovedDraft } from "./skills/draft_service.ts";
+import type { SkillDraft } from "./skills/draft_types.ts";
 import { GitChangeBackend } from "./workspace_change_backend.ts";
 import {
   previewGitCheckpointRollback,
@@ -123,6 +133,18 @@ export async function runCli(): Promise<void> {
   const workspacePath = configureWorkspace(cliArguments.workspace);
   const runtimeConfig = await loadRuntime(workspacePath);
   configureSandbox(runtimeConfig.sandbox);
+  const skillCatalog = new SkillCatalog({
+    workspacePath,
+    userHomePath: process.env.USERPROFILE ?? process.env.HOME,
+  });
+  await skillCatalog.refresh();
+  const skillAudit = new SkillAuditCollector();
+  const skillLoader = new SkillLoader(skillCatalog, skillAudit);
+  let activeToolRegistry: ToolRegistry | undefined;
+  const skillTools = createSkillTools(skillLoader, async (args) => {
+    if (activeToolRegistry === undefined) throw new Error("工具注册表尚未准备完成。");
+    return activeToolRegistry.execute("run_command", JSON.stringify({ args }));
+  });
   const client = new OpenAI({
     apiKey: runtimeConfig.provider.AGENT_API_KEY,
     baseURL: runtimeConfig.provider.base_url,
@@ -159,18 +181,28 @@ export async function runCli(): Promise<void> {
   async function activateSession(
     runtimeSession: PreparedRuntimeSession,
   ): Promise<ReActRuntime> {
+    const toolRegistry = await loadTools(
+      undefined,
+      async (request) => approvalPrompt(terminal, request),
+      skillTools.specs.map((spec) => ({
+        spec,
+        handler: skillTools.handlers[spec.function.name],
+        permission: "allow" as const,
+      })),
+    );
+    activeToolRegistry = toolRegistry;
     const nextAgent = new ReActRuntime(
       client,
       runtimeConfig.provider.model,
       runtimeConfig.prompt,
       runtimeConfig,
-      await loadTools(
-        undefined,
-        async (request) => approvalPrompt(terminal, request),
-      ),
+      toolRegistry,
       {
         recorder: runtimeSession.recorder,
         initialItems: runtimeSession.initialItems,
+        skillContextProvider: (userInput) =>
+          skillCatalog.metadataContext(runtimeConfig.provider.context_window, userInput).context,
+        skillAudit,
       },
     );
     agent = nextAgent;
@@ -188,7 +220,7 @@ export async function runCli(): Promise<void> {
     return restoredAgent;
   }
 
-  async function executeInput(input: string): Promise<void> {
+  async function executeInput(input: string, explicitSkill?: LoadedSkill): Promise<void> {
     let textLineOpen = false;
     closeActiveTextLine = () => {
       if (!textLineOpen) return;
@@ -208,7 +240,17 @@ export async function runCli(): Promise<void> {
             stdout.write(text);
             textLineOpen = true;
           },
-          { signal },
+          {
+            signal,
+            ...(explicitSkill === undefined
+              ? {}
+              : {
+                  explicitSkillContext:
+                    `用户显式选择 Skill ${explicitSkill.metadata.name}。` +
+                    `\n以下内容来自该 Skill 的 SKILL.md，仅作为当前 Turn 的工作流程：\n` +
+                    explicitSkill.body,
+                }),
+          },
         );
         if (textLineOpen) {
           stdout.write("\n");
@@ -328,6 +370,85 @@ export async function runCli(): Promise<void> {
     console.log(`已回滚到检查点 ${selected.checkpointId}。`);
   }
 
+  async function installSkillFromCli(source: string, target: "user" | "repository"): Promise<void> {
+    const result = await installSkill(
+      { source: parseSkillSource(source), target, workspacePath },
+      async (preview: SkillInstallPreview) => {
+        console.log(`\nSkill: ${preview.name}`);
+        console.log(`说明: ${preview.description}`);
+        console.log(`来源: ${preview.source}`);
+        console.log(`安装到: ${preview.targetDirectory}`);
+        console.log(`文件数: ${preview.files.length}`);
+        if (preview.hasScripts) console.warn("警告：该 Skill 包含 scripts 目录，安装阶段不会执行脚本。");
+        const answer = (await terminal.question("确认安装？[y/N]: ")).trim().toLocaleLowerCase();
+        return answer === "y";
+      },
+    );
+    await skillCatalog.refresh();
+    console.log(`Skill 安装成功：${result.metadata.name}`);
+  }
+
+  function showSkillDraft(draft: SkillDraft): void {
+    console.log(`\nDraft: ${draft.id} | ${draft.status}`);
+    console.log(`名称: ${draft.name}`);
+    console.log(`说明: ${draft.description}`);
+    console.log(`来源 Turn: ${draft.sourceTurnIds.join(", ")}`);
+    console.log(`验证: ${draft.validationSummary.join("；")}`);
+    console.log(`脱敏项: ${draft.redactionFindings.length}`);
+    console.log(`\n${draft.instructions}\n`);
+  }
+
+  async function draftModel(prompt: string): Promise<string> {
+    const response = await client.responses.create({
+      model: runtimeConfig.provider.model,
+      instructions: "你是 Skill 草稿生成器。严格按用户要求只输出 JSON。",
+      input: [{ type: "message", role: "user", content: prompt }],
+      store: false,
+      include: ["reasoning.encrypted_content"],
+      stream: false,
+    });
+    if (Symbol.asyncIterator in response) throw new Error("草稿生成不接受流式响应。");
+    if (response.status !== "completed" || response.output_text.length === 0) {
+      throw new Error("模型没有完成 Skill 草稿生成。");
+    }
+    return response.output_text;
+  }
+
+  function showSkills(): void {
+    const skills = skillCatalog.listMetadata();
+    if (skills.length === 0) {
+      console.log("当前没有可用 Skill。");
+      return;
+    }
+    for (const skill of skills) {
+      const implicit = skill.invocation.allowImplicitInvocation ? "模型可调用" : "仅显式调用";
+      const user = skill.invocation.allowUserInvocation ? "用户可调用" : "用户不可调用";
+      const paths = skill.invocation.pathPatterns.length === 0
+        ? "全部路径"
+        : skill.invocation.pathPatterns.join(", ");
+      console.log(`${skill.name} | ${skill.source} | ${implicit} | ${user} | ${paths}`);
+    }
+  }
+
+  async function selectExplicitSkill(skillName: string): Promise<LoadedSkill> {
+    const matches = skillCatalog.getByName(skillName).filter((skill) => skill.enabled);
+    if (matches.length === 0) throw new Error(`未找到 Skill: ${skillName}`);
+    const invocable = matches.filter((skill) => skill.invocation.allowUserInvocation);
+    if (invocable.length === 0) throw new Error(`Skill ${skillName} 不允许用户显式调用`);
+
+    let selected = invocable[0];
+    if (invocable.length > 1) {
+      console.log(`找到多个同名 Skill ${skillName}：`);
+      invocable.forEach((skill, index) => console.log(`${index + 1}. ${skill.source} | ${skill.skillDirectory}`));
+      const answer = (await terminal.question("请选择编号，输入 q 取消: ")).trim().toLocaleLowerCase();
+      if (answer === "q") throw new Error("用户取消 Skill 调用。");
+      const index = Number(answer) - 1;
+      if (!Number.isInteger(index) || index < 0 || index >= invocable.length) throw new Error("Skill 编号无效。");
+      selected = invocable[index];
+    }
+    return skillLoader.loadSkill(selected.id);
+  }
+
   try {
     const handleInterrupt = () => {
       const action = turnController.interrupt();
@@ -350,7 +471,11 @@ export async function runCli(): Promise<void> {
             "/sessions 列出会话 | /new [标题] 新建会话 | " +
               "/resume [session-id] 恢复会话 | /switch <session-id> " +
               "切换会话 | /continue <turn-id> 继续 | " +
-              "/retry <turn-id> 重试 | /rollback <turn-id> 回滚检查点 | /exit 退出",
+              "/retry <turn-id> 重试 | /rollback <turn-id> 回滚检查点 | " +
+              "/skills 列出 Skill | /skill-install <来源> [user|repository] 安装 Skill | " +
+              "/skill-draft <turn-id> 生成草稿 | /skill-drafts 列出草稿 | " +
+              "/skill-review <draft-id> 审阅 | /skill-approve <draft-id> [user|repository] 批准保存 | " +
+              "/skill-reject <draft-id> 拒绝 | $skill-name 或 /skill-name 显式调用 | /exit 退出",
           );
           return;
         }
@@ -359,7 +484,63 @@ export async function runCli(): Promise<void> {
           return;
         }
 
+        if (command.type === "list-skills") {
+          showSkills();
+          return;
+        }
+        if (command.type === "invoke-skill") {
+          const selected = await selectExplicitSkill(command.skillName);
+          const input = command.input.length === 0
+            ? `执行显式指定的 Skill ${command.skillName}。`
+            : command.input;
+          await executeInput(input, selected);
+          return;
+        }
+        if (command.type === "install-skill") {
+          await installSkillFromCli(command.source, command.target);
+          return;
+        }
+
         const sessionStore = await requireStore();
+        if (command.type === "create-skill-draft") {
+          const draft = await createDraftFromTurn(sessionStore, command.turnId, draftModel);
+          showSkillDraft(draft);
+          return;
+        }
+        if (command.type === "list-skill-drafts") {
+          const drafts = sessionStore.listSkillDrafts();
+          if (drafts.length === 0) console.log("当前没有 Skill 草稿。");
+          else drafts.forEach((draft) => console.log(`${draft.id} | ${draft.status} | ${draft.name}`));
+          return;
+        }
+        if (command.type === "review-skill-draft") {
+          showSkillDraft(sessionStore.getSkillDraft(command.draftId));
+          return;
+        }
+        if (command.type === "reject-skill-draft") {
+          showSkillDraft(sessionStore.transitionSkillDraft(command.draftId, "draft", "rejected"));
+          return;
+        }
+        if (command.type === "approve-skill-draft") {
+          const current = sessionStore.getSkillDraft(command.draftId);
+          const approved = current.status === "draft"
+            ? sessionStore.transitionSkillDraft(command.draftId, "draft", "approved")
+            : current;
+          if (approved.status !== "approved") {
+            throw new Error(`Skill 草稿状态不允许批准保存: ${approved.status}`);
+          }
+          showSkillDraft(approved);
+          const answer = (await terminal.question(`确认将 ${approved.name} 安装到 ${command.target}？[y/N]: `)).trim().toLocaleLowerCase();
+          if (answer !== "y") {
+            console.log("草稿已批准但尚未安装，可稍后重试保存。");
+            return;
+          }
+          const saved = await installApprovedDraft(sessionStore, approved.id, command.target, workspacePath);
+          await skillCatalog.refresh();
+          showSkillDraft(saved);
+          return;
+        }
+
         if (command.type === "list-sessions") {
           const sessions = sessionStore.listSessions();
           if (sessions.length === 0) {
@@ -421,6 +602,7 @@ export async function runCli(): Promise<void> {
         }
         if (command.type === "rollback-turn") {
           await rollbackTurn(command.turnId);
+          return;
         }
       },
       onError: (error) => {

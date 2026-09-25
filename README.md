@@ -28,6 +28,12 @@
 - 文件变更追踪：文件工具在前后快照之间生成 `create / modify / delete` 事件、真实内容哈希和 unified diff hunk 行范围，并与工具结果检查点在同一事务中落库；当前不记录修改者归属。
 - Git 工作区基线：Git 仓库在 Turn 开始和结束时通过独立临时 Index 保存 HEAD、真实 Index Tree 和工作区 Tree；可按 Turn 比较新增、修改、删除和重命名文件。`run_command` 在授权后按命令边界追踪 Git 工作区文件副作用，并随工具结果检查点落库；恢复前可按编号展开行级 diff，不修改真实暂存区，非 Git 工作区继续使用快照后端。
 - 检查点回滚：Git 检查点保存工作区 Tree OID，支持通过 `/rollback <turn-id>` 选择检查点、预览差异并在二次确认后恢复工作区文件；不修改真实 Index、HEAD 或提交历史，缺少 Tree 的历史检查点和非 Git 工作区不允许回滚。
+- Skill 接入：支持从本地目录、本地压缩包或用户明确指定的 Git 仓库导入 Skill，安装前展示来源和文件清单，校验通过并确认后安装到用户级或仓库级 `.agents/skills`；安装阶段不执行 Skill 脚本、不自动覆盖同名 Skill。
+- Skill 元数据：使用标准 YAML 安全解析器读取 `SKILL.md` frontmatter，支持多行字符串、列表、布尔值、数字和嵌套对象，并校验名称、目录一致性及描述长度。
+- Skill 渐进式披露：初始请求只注入预算内的 Skill 名称、描述和 ID，模型通过只读 `load_skill` 与 `read_skill_reference` 按需加载正文和引用资料；正文受大小限制并按内容哈希缓存。
+- Skill 调用策略：支持 `$skill-name` 与 `/skill-name` 显式调用、`/skills` 列表、description/`when_to_use` 候选排序和匹配理由；兼容 `agents/openai.yaml` 的隐式调用策略及 `disable-model-invocation`、`user-invocable`、`paths` 等调用控制字段。
+- Skill 审计与脚本：记录 Skill 正文/引用加载和脚本请求事件，脚本通过现有 `run_command`、PermissionEngine、Windows Sandbox 和文件变更追踪执行，当前仅允许 `.ps1`、`.cmd`、`.bat`。
+- Skill 经验沉淀：用户可从已完成且验证通过的 Turn 生成脱敏草稿，审阅后批准或拒绝；批准保存复用现有 Installer，同名 Skill 不会自动覆盖，草稿不会被 Discovery 当作正式 Skill。
 - CLI 取消控制：独立交互状态机区分空闲、运行中、取消中和关闭状态；运行中第一次 Ctrl+C 只取消当前 Turn，空闲时 Ctrl+C 才关闭 CLI，排版状态与业务状态保持隔离。
 
 > CLI 支持自动接续和显式切换；会话重命名与删除命令尚未实现。
@@ -96,6 +102,14 @@ Runtime 的 `runTurn` 支持通过可选 `AbortSignal` 取消当前任务。取�
 | `/switch <session-id>` | 恢复并切换到指定会话 |
 | `/continue <turn-id>` | 使用失败或中断 Turn 的安全上下文，并输入新的继续指令 |
 | `/retry <turn-id>` | 使用失败或中断 Turn 的原始用户目标创建新的重试 Turn |
+| `/skill-install <来源> [user\|repository]` | 预览并安装本地目录、压缩包或 Git 仓库中的 Skill，默认安装到用户级目录 |
+| `/skills` | 列出 Skill 来源、模型调用、用户调用和路径限制状态 |
+| `$skill-name [任务]` 或 `/skill-name [任务]` | 显式加载并在当前 Turn 使用指定 Skill |
+| `/skill-draft <turn-id>` | 从已完成且验证通过的 Turn 生成脱敏 Skill 草稿 |
+| `/skill-drafts` | 列出当前工作区的 Skill 草稿 |
+| `/skill-review <draft-id>` | 查看草稿、证据摘要、验证结果和脱敏数量 |
+| `/skill-approve <draft-id> [user\|repository]` | 人工批准并保存正式 Skill，默认仓库级 |
+| `/skill-reject <draft-id>` | 拒绝未审批草稿 |
 | `/help` | 显示可用命令 |
 | `/exit` | 退出程序 |
 
@@ -180,11 +194,33 @@ coding-agent/
 
 ## 开发状态
 
-当前版本已完成 Responses API ReAct 工具链与流式输出、Turn 取消/失败终态分流、安全重放、失败或中断后的普通后续上下文、持久化检查点与原子 Item 批次、权限模型、文件安全、Windows 沙箱框架、Runtime 会话记录接口、CLI 多轮会话管理、CLI Ctrl+C 取消状态机、`/resume` 会话恢复、`/continue`/`/retry` 显式恢复、恢复前工作区差异确认、历史检查点选择、自动上下文压缩、工具级文件变更事件追踪、Turn 级 Git 工作区起止基线、基线差异查询、`run_command` 命令级副作用追踪、恢复前工作区变化摘要和可展开行级 diff 展示。下一步评估更细粒度的变更来源筛选和大型 diff 分页。
+当前版本已完成 Responses API ReAct 工具链与流式输出、Turn 取消/失败终态分流、安全重放、失败或中断后的普通后续上下文、持久化检查点与原子 Item 批次、权限模型、文件安全、Windows 沙箱框架、Runtime 会话记录接口、CLI 多轮会话管理、CLI Ctrl+C 取消状态机、`/resume` 会话恢复、`/continue`/`/retry` 显式恢复、恢复前工作区差异确认、历史检查点选择、自动上下文压缩、工具级文件变更事件追踪、Turn 级 Git 工作区起止基线、基线差异查询、`run_command` 命令级副作用追踪、恢复前工作区变化摘要和可展开行级 diff 展示，以及 Skill 导入安装、标准 YAML 解析、渐进式披露、调用策略、显式调用、可解释候选选择、审计、受控脚本执行、验证经验提取、脱敏草稿和人工审批保存。Skill 核心闭环已完成。
 
 ## 更新记录
 
+### 2026-09-26
+
+- feat | 完成 Skill 经验沉淀闭环：仅允许用户从 completed 且存在成功测试、类型检查、构建或 lint 证据的 Turn 生成草稿；工具调用必须闭环，失败步骤和孤立调用会被拒绝。
+- feat | 新增证据脱敏、结构化模型草稿、SQLite Schema v9 草稿状态机和 `/skill-draft`、`/skill-drafts`、`/skill-review`、`/skill-approve`、`/skill-reject`；人工批准后复用 Installer 保存，同名 Skill 不自动覆盖。
+
+### 2026-09-25
+
+- feat | 新增 Skill 生命周期审计和 SQLite Schema v8：记录正文加载、引用读取、脚本请求与执行事件，在 Turn 终态前按现有事务边界落库；审计失败不覆盖原始 Turn 结果。
+- feat | 新增 `run_skill_script` 受控工具，仅允许 Skill `scripts/` 下的 `.ps1`、`.cmd`、`.bat`，通过现有 `run_command` 复用 PermissionEngine、Windows Sandbox、Git/快照文件变更追踪和检查点机制。
+
+- feat | 新增 Skill 显式与隐式调用策略：支持 `$skill-name`、`/skill-name` 和 `/skills`，兼容 Codex `agents/openai.yaml` 的 `allow_implicit_invocation` 及 Claude Code 的 `disable-model-invocation`、`user-invocable`、`when_to_use` 和 `paths`。
+- 新增确定性候选排序与匹配理由，按名称、description/`when_to_use`、适用路径和来源排序预算候选；本地分数只用于候选排序，最终隐式选择仍由模型通过 `load_skill` 完成。显式 Skill 正文仅注入当前 Turn，不进入后续 Turn。
+
 ### 2026-09-24
+
+- feat | 接入 Skill 渐进式披露链路：新增 Skill Catalog 和上下文预算，初始请求只注入有限的名称、描述和 Skill ID，默认按上下文窗口 2% 计算预算，未知窗口时使用 8000 字符上限。
+- 新增只读 Skill Loader、`load_skill` 和 `read_skill_reference` 工具；正文按需加载并限制大小，引用仅允许读取 `references/` 和 `assets/`，同一 Loader 实例内按内容缓存，不执行脚本、不授予额外权限。
+
+- fix | 将 Skill `SKILL.md` frontmatter 从手写键值解析替换为 `yaml` 标准安全解析，支持多行描述、列表、布尔值、数字和嵌套对象；未知字段保留为只读元数据，不直接授予工具权限。
+- 加强 Skill 元数据校验：要求 `name` 为 64 字符以内的小写短横线标识并与目录名一致，要求 `description` 为非空字符串且不超过 1024 字符；补充首行边界、非法 YAML 和多类型 frontmatter 测试。
+
+- feat | 新增 Skill 接入与安装闭环：支持本地目录、本地压缩包和用户明确指定的 Git 仓库来源；安装前校验 `SKILL.md`、路径边界和压缩包条目，展示文件清单并经用户确认后以临时目录校验、原子移动方式安装到用户级或仓库级 `.agents/skills`。
+- 新增同名 Skill 拒绝覆盖、安装取消清理、外部符号链接拒绝和安装后 Discovery 复核；安装阶段不读取正文用于模型上下文、不执行 `scripts`，也不改变权限或沙箱。
 
 - feat | 在 `/continue` 和 `/retry` 进入恢复确认前展示来源 Turn 的工作区变化摘要，包含新增、修改、删除路径和 diff hunk 数量；展示逻辑只读，不自动覆盖、回滚或修改用户文件。
 - feat | 统一合并已落库的工具级文件事件与 Turn 级 Git 差异，按操作、路径和前后哈希去重；恢复确认前支持按编号展开完整 unified diff hunk 行内容，继续保持只读安全边界。

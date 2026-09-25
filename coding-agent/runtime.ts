@@ -12,6 +12,7 @@ import type {
   TurnFailureReason,
   TurnInterruptionReason,
 } from "./turn_lifecycle.ts";
+import type { SkillAuditCollector, SkillAuditEvent } from "./skills/audit.ts";
 
 export type RuntimeTurn = {
   input: string;
@@ -77,15 +78,20 @@ export type SessionRecorder = {
     summary: string,
     throughTurnSequence: number,
   ): Promise<void>;
+  appendSkillAuditEvents?(turnId: string, events: SkillAuditEvent[]): Promise<void>;
 };
 
 export type ReActRuntimeOptions = {
   recorder?: SessionRecorder;
   initialItems?: ResponseInputItem[];
+  skillContext?: string;
+  skillContextProvider?: (userInput: string) => string;
+  skillAudit?: SkillAuditCollector;
 };
 
 export type RunTurnOptions = {
   signal?: AbortSignal;
+  explicitSkillContext?: string;
 };
 
 export class TurnCancelledError extends Error {
@@ -357,6 +363,9 @@ export class ReActRuntime {
   private readonly client: ResponsesClient;
   private readonly model: string;
   private readonly systemPrompt: string;
+  private readonly skillContext: string;
+  private readonly skillContextProvider?: (userInput: string) => string;
+  private readonly skillAudit?: SkillAuditCollector;
   private readonly tools: ToolRegistry;
   private readonly recorder?: SessionRecorder;
   private readonly inputItems: ResponseInputItem[];
@@ -372,6 +381,9 @@ export class ReActRuntime {
     this.client = client;
     this.model = model;
     this.systemPrompt = systemPrompt;
+    this.skillContext = options.skillContext ?? "";
+    this.skillContextProvider = options.skillContextProvider;
+    this.skillAudit = options.skillAudit;
     this.runtime = runtime;
     this.tools = tools;
     this.recorder = options.recorder;
@@ -399,7 +411,11 @@ export class ReActRuntime {
     try {
       throwIfAborted(options.signal);
       const workspaceBaseline = await this.tools.captureWorkspaceBaseline();
-      turnId = await this.startRecordedTurn(userInput, workspaceBaseline);
+      const startedTurnId = await this.startRecordedTurn(userInput, workspaceBaseline);
+      turnId = startedTurnId;
+      if (this.skillAudit !== undefined && startedTurnId !== undefined) {
+        this.skillAudit.beginTurn(startedTurnId);
+      }
       this.inputItems.push({
         type: "message",
         role: "user",
@@ -412,7 +428,7 @@ export class ReActRuntime {
         const stepLabel = `[Step ${step + 1}/${this.runtime.maxSteps}]`;
         emitSafely(output, `${stepLabel} → 请求模型`);
 
-        const request = this.createRequest();
+        const request = this.createRequest(userInput, options.explicitSkillContext);
         let response: ModelResponse;
         let responseTextWasWritten = false;
         try {
@@ -462,6 +478,7 @@ export class ReActRuntime {
           }
           emitSafely(output, `${stepLabel} ← 最终回答`);
           if (turnId !== undefined) {
+            await this.persistSkillAuditEvents(turnId);
             const endBaseline = await this.captureEndBaseline();
             await this.completeRecordedTurn(turnId, endBaseline);
           }
@@ -518,6 +535,7 @@ export class ReActRuntime {
       const endBaseline = turnId !== undefined
         ? await this.captureEndBaseline()
         : undefined;
+      if (turnId !== undefined) await this.persistSkillAuditEvents(turnId);
       const terminationRecorded = turnId !== undefined
         ? await this.recordTurnTermination(turnId, error, endBaseline)
         : false;
@@ -534,6 +552,16 @@ export class ReActRuntime {
       throw error;
     } finally {
       this.tools.finishTurn();
+    }
+  }
+
+  private async persistSkillAuditEvents(turnId: string): Promise<void> {
+    const events = this.skillAudit?.takeEvents() ?? [];
+    if (events.length === 0) return;
+    try {
+      await this.recorder?.appendSkillAuditEvents?.(turnId, events);
+    } catch {
+      // 审计失败不能覆盖原始 Turn 结果，也不能再次污染当前 Turn。
     }
   }
 
@@ -558,10 +586,14 @@ export class ReActRuntime {
     return replay.items;
   }
 
-  private createRequest(): ResponsesRequest {
+  private createRequest(userInput: string, explicitSkillContext?: string): ResponsesRequest {
+    const candidateContext = this.skillContextProvider?.(userInput) ?? this.skillContext;
+    const skillContext = [candidateContext, explicitSkillContext ?? ""].filter((value) => value.length > 0).join("\n\n");
     const request: ResponsesRequest = {
       model: this.model,
-      instructions: this.systemPrompt,
+      instructions: skillContext.length === 0
+        ? this.systemPrompt
+        : `${this.systemPrompt}\n\n${skillContext}`,
       input: [...this.inputItems],
       store: false,
       include: ["reasoning.encrypted_content"],

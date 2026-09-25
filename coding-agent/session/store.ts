@@ -42,6 +42,9 @@ import {
   type TurnTerminationReason,
   validateTurnTermination,
 } from "../turn_lifecycle.ts";
+import type { SkillAuditEvent } from "../skills/audit.ts";
+import type { RedactionFinding, SkillDraft, SkillDraftStatus } from "../skills/draft_types.ts";
+import type { SkillEvidenceInput } from "../skills/evidence.ts";
 
 export type { TurnStatus } from "../turn_lifecycle.ts";
 
@@ -105,6 +108,34 @@ export type FileChangeEvent = {
   toolName: string | null;
   createdAt: number;
 };
+
+function parseJsonArray<T>(value: unknown, label: string): T[] {
+  try {
+    const parsed: unknown = JSON.parse(stringValue(value, label));
+    if (!Array.isArray(parsed)) throw new Error(`${label} 不是数组`);
+    return parsed as T[];
+  } catch (error) {
+    throw new Error(`无法读取 ${label}: ${error instanceof Error ? error.message : error}`);
+  }
+}
+
+function skillDraftFromRow(value: unknown): SkillDraft {
+  const data = row(value);
+  return {
+    id: stringValue(data.id, "skill_drafts.id"),
+    name: stringValue(data.name, "skill_drafts.name"),
+    description: stringValue(data.description, "skill_drafts.description"),
+    instructions: stringValue(data.instructions, "skill_drafts.instructions"),
+    status: stringValue(data.status, "skill_drafts.status") as SkillDraftStatus,
+    suggestedTarget: stringValue(data.suggested_target, "skill_drafts.suggested_target") as "user" | "repository",
+    sourceTurnIds: parseJsonArray<string>(data.source_turn_ids_json, "skill_drafts.source_turn_ids_json"),
+    evidenceSummary: parseJsonArray<string>(data.evidence_summary_json, "skill_drafts.evidence_summary_json"),
+    validationSummary: parseJsonArray<string>(data.validation_summary_json, "skill_drafts.validation_summary_json"),
+    redactionFindings: parseJsonArray<RedactionFinding>(data.redaction_findings_json, "skill_drafts.redaction_findings_json"),
+    createdAt: numberValue(data.created_at, "skill_drafts.created_at"),
+    updatedAt: numberValue(data.updated_at, "skill_drafts.updated_at"),
+  };
+}
 
 function toFileChangeInput(change: FileChangeEvent): FileChangeEventInput {
   return {
@@ -500,6 +531,73 @@ export class SessionStore {
     return this.requireSessionForWorkspace(sessionId);
   }
 
+  getSkillEvidenceInput(turnId: string): SkillEvidenceInput {
+    const turn = this.requireRunningOrFinishedTurn(turnId);
+    this.requireSessionForWorkspace(turn.sessionId);
+    return {
+      turnId: turn.id,
+      userGoal: turn.userInput,
+      status: turn.status,
+      completedAt: turn.completedAt,
+      items: this.turnItems(turn.sessionId, turn.id),
+      fileChanges: this.listTurnFileChanges(turn.id).map(toFileChangeInput),
+    };
+  }
+
+  createSkillDraft(input: Omit<SkillDraft, "id" | "status" | "createdAt" | "updatedAt">): SkillDraft {
+    return this.transaction(() => {
+      for (const turnId of input.sourceTurnIds) {
+        const turn = this.requireRunningOrFinishedTurn(turnId);
+        this.requireSessionForWorkspace(turn.sessionId);
+      }
+      const id = this.createId();
+      const timestamp = this.now();
+      this.database.prepare(`
+        INSERT INTO skill_drafts
+          (id, workspace_key, name, description, instructions, status, suggested_target,
+           source_turn_ids_json, evidence_summary_json, validation_summary_json,
+           redaction_findings_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        id,
+        this.workspaceKey,
+        input.name,
+        input.description,
+        input.instructions,
+        input.suggestedTarget,
+        JSON.stringify(input.sourceTurnIds),
+        JSON.stringify(input.evidenceSummary),
+        JSON.stringify(input.validationSummary),
+        JSON.stringify(input.redactionFindings),
+        timestamp,
+        timestamp,
+      );
+      return this.getSkillDraft(id);
+    });
+  }
+
+  getSkillDraft(draftId: string): SkillDraft {
+    const result = this.database.prepare(`SELECT * FROM skill_drafts WHERE id = ? AND workspace_key = ?`).get(draftId, this.workspaceKey);
+    if (result === undefined) throw new Error(`Skill 草稿不存在: ${draftId}`);
+    return skillDraftFromRow(result);
+  }
+
+  listSkillDrafts(): SkillDraft[] {
+    return this.database.prepare(`SELECT * FROM skill_drafts WHERE workspace_key = ? ORDER BY updated_at DESC, id DESC`).all(this.workspaceKey).map(skillDraftFromRow);
+  }
+
+  transitionSkillDraft(draftId: string, expected: SkillDraftStatus, next: SkillDraftStatus): SkillDraft {
+    const allowed = (expected === "draft" && (next === "approved" || next === "rejected")) ||
+      (expected === "approved" && next === "saved");
+    if (!allowed) throw new Error(`非法 Skill 草稿状态迁移: ${expected} -> ${next}`);
+    return this.transaction(() => {
+      const current = this.getSkillDraft(draftId);
+      if (current.status !== expected) throw new Error(`Skill 草稿状态不是 ${expected}: ${current.status}`);
+      this.database.prepare(`UPDATE skill_drafts SET status = ?, updated_at = ? WHERE id = ?`).run(next, this.now(), draftId);
+      return this.getSkillDraft(draftId);
+    });
+  }
+
   startTurn(
     sessionId: string,
     userInput: string,
@@ -567,6 +665,34 @@ export class SessionStore {
     metadata: CheckpointMetadata = {},
   ): void {
     this.appendItemsWithCheckpoint(turnId, [item], "tool_result", metadata);
+  }
+
+  appendSkillAuditEvents(turnId: string, events: SkillAuditEvent[]): void {
+    if (events.length === 0) return;
+    this.transaction(() => {
+      const turn = this.requireRunningTurn(turnId);
+      this.requireSessionForWorkspace(turn.sessionId);
+      const statement = this.database.prepare(`
+        INSERT INTO skill_audit_events
+          (session_id, turn_id, skill_id, action, source, content_hash,
+           loaded_characters, reference_path, reason, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const event of events) {
+        statement.run(
+          turn.sessionId,
+          turnId,
+          event.skillId,
+          event.action,
+          event.source,
+          event.contentHash ?? null,
+          event.loadedCharacters ?? null,
+          event.referencePath ?? null,
+          event.reason ?? null,
+          event.createdAt,
+        );
+      }
+    });
   }
 
   listTurnCheckpoints(turnId: string): TurnCheckpoint[] {
@@ -963,6 +1089,9 @@ export class SessionStore {
       },
       appendToolResult: async (turnId, item, metadata) => {
         this.appendToolResult(turnId, item, metadata);
+      },
+      appendSkillAuditEvents: async (turnId, events) => {
+        this.appendSkillAuditEvents(turnId, events);
       },
       completeTurn: async (turnId, workspaceEndBaseline) => {
         this.completeTurn(turnId, workspaceEndBaseline);

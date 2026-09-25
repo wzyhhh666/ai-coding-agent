@@ -45,6 +45,12 @@ export type ToolRegistryOptions = {
   workspaceBackend?: WorkspaceChangeBackend;
 };
 
+export type AdditionalTool = {
+  spec: ToolSpec;
+  handler: ToolHandler;
+  permission?: PermissionAction;
+};
+
 export function toResponseTools(specs: ToolSpec[]): ResponseToolSpec[] {
   return specs.map((spec) => ({
     type: "function",
@@ -246,6 +252,7 @@ export class ToolRegistry {
 export async function loadTools(
   root = BASE_DIR,
   approvalPrompt?: ApprovalPrompt,
+  additionalTools: AdditionalTool[] = [],
 ): Promise<ToolRegistry> {
   const workspaceBackend = await createWorkspaceChangeBackend(
     root === BASE_DIR ? getWorkspaceRoot() : root,
@@ -318,6 +325,17 @@ export async function loadTools(
         parameters,
       },
     });
+  }
+
+  for (const additional of additionalTools) {
+    const name = additional.spec.function.name;
+    if (handlers[name]) throw new Error(`工具名称为空或重复: ${name}`);
+    if (additional.spec.function.parameters.type !== "object") {
+      throw new Error(`工具 ${name} 参数 Schema 必须声明 type: object`);
+    }
+    handlers[name] = additional.handler;
+    policies[name] = additional.permission ?? "allow";
+    specs.push(additional.spec);
   }
 
   return new ToolRegistry(

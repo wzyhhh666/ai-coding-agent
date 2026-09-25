@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-export const CURRENT_SCHEMA_VERSION = 7;
+export const CURRENT_SCHEMA_VERSION = 9;
 export const STATE_DIRECTORY_MODE = 0o700;
 export const STATE_DATABASE_MODE = 0o600;
 
@@ -318,6 +318,54 @@ const MIGRATIONS: Migration[] = [
       ALTER TABLE turn_checkpoints ADD COLUMN workspace_tree_oid TEXT;
     `,
   },
+  {
+    version: 8,
+    sql: `
+      CREATE TABLE skill_audit_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        skill_id TEXT NOT NULL,
+        action TEXT NOT NULL
+          CHECK (action IN ('discovered', 'candidate', 'omitted', 'loaded', 'reference_loaded', 'rejected', 'script_requested', 'script_executed')),
+        source TEXT NOT NULL
+          CHECK (source IN ('user', 'repository', 'installed')),
+        content_hash TEXT,
+        loaded_characters INTEGER,
+        reference_path TEXT,
+        reason TEXT,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+        FOREIGN KEY (turn_id) REFERENCES turns(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX skill_audit_events_turn_created_idx
+      ON skill_audit_events(turn_id, created_at, id);
+    `,
+  },
+  {
+    version: 9,
+    sql: `
+      CREATE TABLE skill_drafts (
+        id TEXT PRIMARY KEY,
+        workspace_key TEXT NOT NULL,
+        name TEXT NOT NULL,
+        description TEXT NOT NULL,
+        instructions TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('draft', 'approved', 'rejected', 'saved')),
+        suggested_target TEXT NOT NULL CHECK (suggested_target IN ('user', 'repository')),
+        source_turn_ids_json TEXT NOT NULL,
+        evidence_summary_json TEXT NOT NULL,
+        validation_summary_json TEXT NOT NULL,
+        redaction_findings_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX skill_drafts_status_updated_idx
+      ON skill_drafts(workspace_key, status, updated_at DESC);
+    `,
+  },
 ];
 
 export function stateDatabasePath(): string {
@@ -438,6 +486,8 @@ function validateCurrentSchema(database: DatabaseSync): void {
   const itemColumns = tableColumns(database, "items");
   const checkpointColumns = tableColumns(database, "turn_checkpoints");
   const fileChangeEventColumns = tableColumns(database, "file_change_events");
+  const skillAuditColumns = tableColumns(database, "skill_audit_events");
+  const skillDraftColumns = tableColumns(database, "skill_drafts");
   if (
     !sessionColumns.has("workspace_key") ||
     !turnColumns.has("termination_reason") ||
@@ -447,6 +497,13 @@ function validateCurrentSchema(database: DatabaseSync): void {
     !checkpointColumns.has("through_item_sequence") ||
     !checkpointColumns.has("workspace_tree_oid") ||
     !fileChangeEventColumns.has("diff_hunks_json") ||
+    !skillAuditColumns.has("skill_id") ||
+    !skillAuditColumns.has("action") ||
+    !skillDraftColumns.has("status") ||
+    !skillDraftColumns.has("workspace_key") ||
+    !skillDraftColumns.has("redaction_findings_json") ||
+    !schemaObjectExists(database, "index", "skill_drafts_status_updated_idx") ||
+    !schemaObjectExists(database, "index", "skill_audit_events_turn_created_idx") ||
     !schemaObjectExists(
       database,
       "index",
