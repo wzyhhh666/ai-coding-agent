@@ -35,6 +35,10 @@
 - Skill 审计与脚本：记录 Skill 正文/引用加载和脚本请求事件，脚本通过现有 `run_command`、PermissionEngine、Windows Sandbox 和文件变更追踪执行，当前仅允许 `.ps1`、`.cmd`、`.bat`。
 - Skill 经验沉淀：用户可从已完成且验证通过的 Turn 生成脱敏草稿，审阅后批准或拒绝；批准保存复用现有 Installer，同名 Skill 不会自动覆盖，草稿不会被 Discovery 当作正式 Skill。
 - CLI 取消控制：独立交互状态机区分空闲、运行中、取消中和关闭状态；运行中第一次 Ctrl+C 只取消当前 Turn，空闲时 Ctrl+C 才关闭 CLI，排版状态与业务状态保持隔离。
+- MCP 工具治理（阶段一）：支持用户级 MCP 配置、本地 stdio 和远程 Streamable HTTP Server 的连接、工具发现、白名单、审批、Schema 校验、调用结果限制和 ToolRegistry 适配；远程连接默认校验 HTTPS、允许 Origin 和禁止私网地址。
+- MCP 远程身份（阶段二）：支持用户级 credential profile、API Key/Bearer 凭据、AES-256-GCM 加密凭据文件，以及 OAuth 2.1 Authorization Code + PKCE 的元数据发现、Token 交换、刷新和 state 校验。
+- MCP 受控网络（阶段三）：后端支持 Origin/DNS/IP 校验、同源重定向限制、请求超时、响应大小、并发控制、GET/HEAD 有限指数退避和 OAuth loopback 回调；不增加复杂 CLI。
+- Windows 沙箱阶段一：新增统一 `SandboxExecutionPlan`，让 `run_command`、Skill 脚本和本地 MCP stdio 复用同一沙箱启动路径，并在结果中返回后端、强隔离和网络模式摘要；Job Object、AppContainer、受限令牌和 WFP 留待后续阶段。
 
 > CLI 支持自动接续和显式切换；会话重命名与删除命令尚未实现。
 
@@ -85,6 +89,8 @@ context_window = 400000
 `config/settings.toml` 是本地敏感配置，不应提交到版本库。仓库仅提供不含密钥的 `settings.example.toml`。
 
 配置的 Provider、`base_url` 和模型必须支持 `/responses`。项目不会静默回退到旧协议，接口不兼容时会返回明确错误。
+
+MCP 用户级配置位于用户目录的 `.coding-agent/mcp.toml`，凭据 Profile 只保存引用；凭据密文位于 `.coding-agent/credentials.enc.json`，写入前必须设置至少 16 个字符的 `CODING_AGENT_CREDENTIAL_KEY` 环境变量。不要把该环境变量或凭据文件提交到版本库。
 
 `streaming` 默认为 `true`，普通模型调用通过 SSE 实时输出文本。若兼容的第三方 Provider 已实现 `/responses` 但不支持流式事件，可将其设为 `false`，运行时会使用非流式响应；上下文压缩固定使用非流式请求。无论采用哪种模式，只有终态 Response 中的完整 Items 会写入会话，文本增量不会单独持久化。
 
@@ -185,6 +191,8 @@ coding-agent/
 ├── turn_lifecycle.ts         # Turn 状态、终止原因与契约校验
 ├── sqlite.ts                 # SQLite Schema 与迁移
 ├── session/                  # SessionStore、Turn 与 Item 持久化
+├── mcp/                      # MCP Server 配置、Transport、发现、网络目标校验与工具适配
+├── tools/sandbox_policy.ts   # 统一命令、Skill 和 MCP stdio 的沙箱执行计划
 ├── file_change_tracker.ts    # 文件变更和 diff
 ├── workspace_change_backend.ts # Git 工作区基线与快照降级后端
 ├── config/                   # Prompt、工具和本地配置
@@ -194,12 +202,19 @@ coding-agent/
 
 ## 开发状态
 
-当前版本已完成 Responses API ReAct 工具链与流式输出、Turn 取消/失败终态分流、安全重放、失败或中断后的普通后续上下文、持久化检查点与原子 Item 批次、权限模型、文件安全、Windows 沙箱框架、Runtime 会话记录接口、CLI 多轮会话管理、CLI Ctrl+C 取消状态机、`/resume` 会话恢复、`/continue`/`/retry` 显式恢复、恢复前工作区差异确认、历史检查点选择、自动上下文压缩、工具级文件变更事件追踪、Turn 级 Git 工作区起止基线、基线差异查询、`run_command` 命令级副作用追踪、恢复前工作区变化摘要和可展开行级 diff 展示，以及 Skill 导入安装、标准 YAML 解析、渐进式披露、调用策略、显式调用、可解释候选选择、审计、受控脚本执行、验证经验提取、脱敏草稿和人工审批保存。Skill 核心闭环已完成。
+当前版本已完成 Responses API ReAct 工具链与流式输出、Turn 取消/失败终态分流、安全重放、失败或中断后的普通后续上下文、持久化检查点与原子 Item 批次、权限模型、文件安全、Windows 沙箱框架、Runtime 会话记录接口、CLI 多轮会话管理、CLI Ctrl+C 取消状态机、`/resume` 会话恢复、`/continue`/`/retry` 显式恢复、恢复前工作区差异确认、历史检查点选择、自动上下文压缩、工具级文件变更事件追踪、Turn 级 Git 工作区起止基线、基线差异查询、`run_command` 命令级副作用追踪、恢复前工作区变化摘要和可展开行级 diff 展示，以及 Skill 导入安装、标准 YAML 解析、渐进式披露、调用策略、显式调用、可解释候选选择、审计、受控脚本执行、验证经验提取、脱敏草稿和人工审批保存。Skill 核心闭环已完成。MCP 阶段一已完成本地/远程工具发现、基础授权、调用和结果适配，阶段二已完成用户级静态凭据和 OAuth 认证基础链路，阶段三已完成受控网络访问和稳定性后端。Windows 沙箱阶段一已完成统一策略编排和命令/MCP stdio 受控启动闭环。
 
 ## 更新记录
 
+### 2026-09-27
+
+- feat | 完成 MCP 阶段三后端网络治理：接入 Origin/DNS/IP 校验、同源重定向限制、请求超时、响应大小、并发控制、GET/HEAD 有限指数退避和 OAuth loopback 回调；不增加复杂 CLI。
+- feat | 完成 Windows 沙箱阶段一：统一 `SandboxExecutionPlan`，让命令、Skill 脚本和本地 MCP stdio 复用同一沙箱启动路径，并输出沙箱后端和网络模式摘要。
+
 ### 2026-09-26
 
+- feat | 新增 MCP 阶段一治理闭环：支持用户级配置、本地 stdio 和远程 Streamable HTTP Server，完成工具发现、白名单、审批、Schema 校验、结果限制、基础发现缓存和 HTTPS/Origin/私网目标校验。
+- feat | 新增 MCP 阶段二远程身份链路：支持 credential profile、API Key/Bearer 凭据、AES-256-GCM 加密存储、OAuth 2.1 PKCE 授权码交换、刷新、撤销基础能力和 state 校验。
 - feat | 完成 Skill 经验沉淀闭环：仅允许用户从 completed 且存在成功测试、类型检查、构建或 lint 证据的 Turn 生成草稿；工具调用必须闭环，失败步骤和孤立调用会被拒绝。
 - feat | 新增证据脱敏、结构化模型草稿、SQLite Schema v9 草稿状态机和 `/skill-draft`、`/skill-drafts`、`/skill-review`、`/skill-approve`、`/skill-reject`；人工批准后复用 Installer 保存，同名 Skill 不自动覆盖。
 

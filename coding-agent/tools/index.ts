@@ -1,5 +1,6 @@
 export { configureWorkspace } from "./_common.ts";
 export { configureSandbox, getSandboxConfig } from "./sandbox.ts";
+export { createSandboxExecutionPlan, sandboxPlanSummary } from "./sandbox_policy.ts";
 export { editFileTool, edit_file } from "./edit_file.ts";
 export { readFileTool, read_file } from "./read_file.ts";
 export { runCommand, run_command } from "./run_command.ts";

@@ -1,0 +1,21 @@
+# 用户级 MCP 配置示例
+
+[[servers]]
+id = "local-tools"
+display_name = "Local Tools"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@example/mcp-server"]
+enabled = false
+require_approval = "always"
+
+[[servers]]
+id = "remote-tools"
+display_name = "Remote Tools"
+transport = "streamable-http"
+url = "https://mcp.example.com/mcp"
+allowed_origins = ["https://mcp.example.com"]
+allowed_tools = ["search"]
+credential_profile = "remote-tools"
+enabled = false
+require_approval = "always"

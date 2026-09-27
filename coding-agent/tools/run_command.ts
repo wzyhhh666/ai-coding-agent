@@ -14,6 +14,7 @@ import {
   detectSandbox,
   getSandboxConfig,
 } from "./sandbox.ts";
+import { createSandboxExecutionPlan, sandboxPlanSummary } from "./sandbox_policy.ts";
 
 export type PreparedCommand = {
   executable: string;
@@ -30,6 +31,7 @@ type CommandData = {
   truncated: boolean;
   sandboxed: boolean;
   backend: string;
+  sandbox_policy?: Record<string, unknown>;
   sandbox_denied?: true;
 };
 
@@ -65,14 +67,14 @@ export async function runCommand(
   try {
     const [workdir, relativeCwd] = await workspacePath(cwd);
     const workspaceRoot = getWorkspaceRoot();
-    const sandboxStatus = detectSandbox(sandbox);
-    const prepared = buildSandboxedCommand(
+    const plan = createSandboxExecutionPlan(
+      "command",
       args as string[],
       workspaceRoot,
-      sandboxStatus,
       sandbox,
       relativeCwd,
     );
+    const prepared = plan.prepared;
     const result = await new Promise<CommandData>((resolve, reject) => {
       const child = spawn(prepared.executable, prepared.args, {
         cwd: workdir,
@@ -104,6 +106,7 @@ export async function runCommand(
           truncated: outTruncated || errTruncated,
           sandboxed: prepared.sandboxed,
           backend: prepared.backend,
+          sandbox_policy: sandboxPlanSummary(plan),
           ...(prepared.warning === undefined ? {} : { warning: prepared.warning }),
         });
       });

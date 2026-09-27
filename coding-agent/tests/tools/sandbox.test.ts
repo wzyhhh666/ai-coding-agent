@@ -9,6 +9,7 @@ import {
   sandboxApprovalWarning,
   validateWindowsWslCommand,
 } from "../../tools/sandbox.ts";
+import { createSandboxExecutionPlan, sandboxPlanSummary } from "../../tools/sandbox_policy.ts";
 import type { SandboxConfig } from "../../config.ts";
 
 function config(overrides: Partial<SandboxConfig> = {}): SandboxConfig {
@@ -85,6 +86,26 @@ test("bwrap 后端构造关闭网络并绑定工作区", () => {
   assert.ok(prepared.args.includes(path.resolve("/workspace/project")));
   assert.ok(prepared.args.includes("--chdir"));
   assert.equal(prepared.env.AGENT_API_KEY, undefined);
+});
+
+test("统一沙箱执行计划保留操作、后端和网络模式", () => {
+  const plan = createSandboxExecutionPlan(
+    "command",
+    ["node", "--version"],
+    "C:\\workspace",
+    config({ mode: "soft" }),
+  );
+  assert.equal(plan.operation, "command");
+  assert.equal(plan.status.backend, "soft");
+  assert.equal(plan.network, "host");
+  assert.deepEqual(sandboxPlanSummary(plan), {
+    operation: "command",
+    backend: "soft",
+    strong: false,
+    network: "host",
+    sandboxed: false,
+    warning: "当前命令运行在应用层防护模式，不具备内核级隔离",
+  });
 });
 
 test("Windows WSL 后端只挂载必要系统目录和指定工作区", () => {

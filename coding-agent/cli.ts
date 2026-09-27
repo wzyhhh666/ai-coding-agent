@@ -27,7 +27,7 @@ import {
   initializeStateDatabase,
   STATE_PRIVACY_NOTICE,
 } from "./sqlite.ts";
-import { configureSandbox, configureWorkspace } from "./tools/index.ts";
+import { configureSandbox, configureWorkspace, getSandboxConfig } from "./tools/index.ts";
 import { loadTools, type ToolRegistry } from "./tools/registry.ts";
 import { installSkill } from "./skills/installer.ts";
 import { parseSkillSource } from "./skills/source.ts";
@@ -44,6 +44,7 @@ import {
   previewGitCheckpointRollback,
   rollbackGitWorkspaceToCheckpoint,
 } from "./workspace_rollback.ts";
+import { McpServerManager } from "./mcp/server_manager.ts";
 
 export type CliArguments = {
   workspace: string;
@@ -150,6 +151,8 @@ export async function runCli(): Promise<void> {
     baseURL: runtimeConfig.provider.base_url,
   }) as unknown as ResponsesClient;
   const terminal = createInterface({ input: stdin, output: stdout });
+  const mcpManager = new McpServerManager(workspacePath, undefined, undefined, getSandboxConfig());
+  let mcpLoaded = false;
   let database: DatabaseSync | undefined;
   let store: SessionStore | undefined;
   let agent: ReActRuntime | undefined;
@@ -181,14 +184,25 @@ export async function runCli(): Promise<void> {
   async function activateSession(
     runtimeSession: PreparedRuntimeSession,
   ): Promise<ReActRuntime> {
+    if (!mcpLoaded) {
+      await mcpManager.connectAll(async (request) => approvalPrompt(terminal, request));
+      const failed = mcpManager.snapshots().filter((item) => item.status === "failed");
+      if (failed.length > 0) {
+        for (const item of failed) console.warn(`MCP Server ${item.id} 连接失败：${item.error ?? "未知错误"}`);
+      }
+      mcpLoaded = true;
+    }
     const toolRegistry = await loadTools(
       undefined,
       async (request) => approvalPrompt(terminal, request),
-      skillTools.specs.map((spec) => ({
+      [
+        ...mcpManager.additionalTools(),
+        ...skillTools.specs.map((spec) => ({
         spec,
         handler: skillTools.handlers[spec.function.name],
         permission: "allow" as const,
-      })),
+        })),
+      ],
     );
     activeToolRegistry = toolRegistry;
     const nextAgent = new ReActRuntime(
@@ -610,6 +624,7 @@ export async function runCli(): Promise<void> {
       },
     });
   } finally {
+    await mcpManager.close();
     database?.close();
     terminal.close();
   }
