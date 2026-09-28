@@ -45,7 +45,10 @@ workspace_mount = "/agent-workspace"
   assert.deepEqual(runtime.sandbox.windows, {
     wslDistribution: "Ubuntu-24.04",
     workspaceMount: "/agent-workspace",
+    identity: "auto",
   });
+  assert.deepEqual(runtime.sandbox.resources, { maxProcesses: 64, memoryMb: 1024, cpuSeconds: 120 });
+  assert.deepEqual(runtime.sandbox.network, { mode: "deny-all", allowedCidrs: [] });
   assert.deepEqual(runtime.compaction, {
     triggerRatio: 0.8,
     keepRecentTurns: 2,

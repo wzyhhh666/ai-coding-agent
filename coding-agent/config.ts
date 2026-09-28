@@ -19,6 +19,7 @@ export type SandboxBackend =
   | "macos-seatbelt"
   | "linux-bwrap"
   | "windows-wsl-bwrap"
+  | "windows-native"
   | "docker"
   | "podman";
 
@@ -27,9 +28,12 @@ export type SandboxConfig = {
   backend: SandboxBackend;
   allowSoftFallback: boolean;
   image?: string;
+  resources?: { maxProcesses: number; memoryMb: number; cpuSeconds: number };
+  network?: { mode: "deny-all" | "allowlist"; allowedCidrs: string[] };
   windows?: {
     wslDistribution: string;
     workspaceMount: string;
+    identity?: "auto" | "appcontainer" | "restricted-token";
   };
 };
 
@@ -140,6 +144,7 @@ export async function loadRuntime(root = BASE_DIR): Promise<Runtime> {
     "macos-seatbelt",
     "linux-bwrap",
     "windows-wsl-bwrap",
+    "windows-native",
     "docker",
     "podman",
   ];
@@ -152,6 +157,19 @@ export async function loadRuntime(root = BASE_DIR): Promise<Runtime> {
   if (image !== undefined && typeof image !== "string")
     throw new Error("sandbox.image 必须是字符串");
   const windowsConfig = record(sandboxConfig.windows);
+  const resourceConfig = record(sandboxConfig.resources);
+  const maxProcesses = resourceConfig.max_processes ?? 64;
+  const memoryMb = resourceConfig.memory_mb ?? 1024;
+  const cpuSeconds = resourceConfig.cpu_seconds ?? 120;
+  for (const [name, value] of [["max_processes", maxProcesses], ["memory_mb", memoryMb], ["cpu_seconds", cpuSeconds]] as const) {
+    if (!Number.isInteger(value) || Number(value) < 1) throw new Error("sandbox.resources." + name + " 必须是正整数");
+  }
+  const networkConfig = record(sandboxConfig.network);
+  const networkMode = String(networkConfig.mode ?? "deny-all");
+  if (!["deny-all", "allowlist"].includes(networkMode)) throw new Error("sandbox.network.mode 必须是 deny-all 或 allowlist");
+  const allowedCidrs = networkConfig.allowed_cidrs ?? [];
+  if (!Array.isArray(allowedCidrs) || !allowedCidrs.every((value) => typeof value === "string")) throw new Error("sandbox.network.allowed_cidrs 必须是字符串数组");
+  if (networkMode === "allowlist" && allowedCidrs.length === 0) throw new Error("allowlist 网络模式必须配置 allowed_cidrs");
   const wslDistribution = windowsConfig.wsl_distribution ?? "Ubuntu";
   if (
     typeof wslDistribution !== "string" ||
@@ -159,6 +177,8 @@ export async function loadRuntime(root = BASE_DIR): Promise<Runtime> {
   )
     throw new Error("sandbox.windows.wsl_distribution 必须是非空字符串");
   const workspaceMount = windowsConfig.workspace_mount ?? "/workspace";
+  const windowsIdentity = String(windowsConfig.identity ?? "auto");
+  if (!["auto", "appcontainer", "restricted-token"].includes(windowsIdentity)) throw new Error("sandbox.windows.identity 必须是 auto、appcontainer 或 restricted-token");
   if (
     typeof workspaceMount !== "string" ||
     !/^\/[A-Za-z0-9._/-]+$/.test(workspaceMount) ||
@@ -188,9 +208,12 @@ export async function loadRuntime(root = BASE_DIR): Promise<Runtime> {
       backend: backend as SandboxBackend,
       allowSoftFallback,
       ...(image === undefined ? {} : { image }),
+      resources: { maxProcesses: Number(maxProcesses), memoryMb: Number(memoryMb), cpuSeconds: Number(cpuSeconds) },
+      network: { mode: networkMode as "deny-all" | "allowlist", allowedCidrs: allowedCidrs.map(String) },
       windows: {
         wslDistribution: wslDistribution.trim(),
         workspaceMount,
+        identity: windowsIdentity as "auto" | "appcontainer" | "restricted-token",
       },
     },
   };

@@ -11,6 +11,7 @@ import {
 } from "../../tools/sandbox.ts";
 import { createSandboxExecutionPlan, sandboxPlanSummary } from "../../tools/sandbox_policy.ts";
 import type { SandboxConfig } from "../../config.ts";
+import { buildWindowsJobCommand } from "../../tools/windows_job.ts";
 
 function config(overrides: Partial<SandboxConfig> = {}): SandboxConfig {
   return {
@@ -86,6 +87,34 @@ test("bwrap 后端构造关闭网络并绑定工作区", () => {
   assert.ok(prepared.args.includes(path.resolve("/workspace/project")));
   assert.ok(prepared.args.includes("--chdir"));
   assert.equal(prepared.env.AGENT_API_KEY, undefined);
+});
+
+test("Windows 原生后端生成 Job Object 受控启动命令", () => {
+  const prepared = buildWindowsJobCommand(
+    ["node.exe", "-e", "console.log('ok')"],
+    "C:\\workspace",
+    "C:\\workspace",
+    { timeoutSeconds: 30, maxProcesses: 8, memoryBytes: 64 * 1024 * 1024, cpuSeconds: 30 },
+    { mode: "deny-all", allowedCidrs: [], blockedCidrs: ["0.0.0.0/0", "::/0"] },
+    { PATH: "C:\\Windows\\System32" },
+    config({ backend: "windows-native" }),
+  );
+  assert.equal(prepared.executable, "powershell.exe");
+  assert.ok(prepared.args.includes("-File"));
+  assert.ok(prepared.args.some((value) => value.endsWith("windows_sandbox.ps1")));
+  assert.equal(prepared.sandboxed, true);
+  assert.equal(prepared.backend, "windows-native");
+  assert.equal(prepared.identity, "restricted-token");
+  assert.equal(prepared.limits.maxProcesses, 8);
+  assert.equal(prepared.network.mode, "deny-all");
+  assert.equal(prepared.env.AGENT_API_KEY, undefined);
+});
+
+test("Restricted Token 后端在 strict 模式下不会伪装成强文件隔离", () => {
+  assert.throws(
+    () => detectSandbox(config({ mode: "strict", backend: "windows-native", windows: { wslDistribution: "Ubuntu", workspaceMount: "/workspace", identity: "restricted-token" } })),
+    /兼容后备/,
+  );
 });
 
 test("统一沙箱执行计划保留操作、后端和网络模式", () => {

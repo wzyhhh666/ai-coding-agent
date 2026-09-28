@@ -12,9 +12,19 @@ mode = "auto"
 backend = "auto"
 allow_soft_fallback = true
 
+[sandbox.resources]
+max_processes = 64
+memory_mb = 1024
+cpu_seconds = 120
+
+[sandbox.network]
+mode = "deny-all"
+allowed_cidrs = []
+
 [sandbox.windows]
 wsl_distribution = "Ubuntu"
 workspace_mount = "/workspace"
+identity = "auto"
 
 [providers.openai]
 AGENT_API_KEY = ""

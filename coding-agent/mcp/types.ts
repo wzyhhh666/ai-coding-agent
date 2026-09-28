@@ -41,4 +41,5 @@ export type McpServerSnapshot = {
   origin?: string;
   toolCount: number;
   error?: string;
+  sandboxPolicy?: Record<string, unknown>;
 };

@@ -2,6 +2,8 @@ import { spawnSync } from "node:child_process";
 import path from "node:path";
 
 import type { SandboxBackend, SandboxConfig } from "../config.ts";
+import { windowsAppContainerAvailable, windowsNativeAvailable, buildWindowsJobCommand } from "./windows_job.ts";
+import { blockedIpv4Cidrs, normalizeAllowedIpv4Cidrs } from "./network_ranges.ts";
 
 export type EffectiveSandboxBackend = Exclude<SandboxBackend, "auto">;
 
@@ -12,6 +14,9 @@ export type SandboxedCommand = {
   sandboxed: boolean;
   backend: EffectiveSandboxBackend;
   warning?: string;
+  identity?: "auto" | "appcontainer" | "restricted-token";
+  limits?: { timeoutSeconds: number; maxProcesses: number; memoryBytes: number; cpuSeconds: number };
+  network?: { mode: "deny-all" | "allowlist"; allowedCidrs: string[]; blockedCidrs: string[] };
 };
 
 export type SandboxStatus = {
@@ -152,6 +157,16 @@ export function detectSandbox(config: SandboxConfig): SandboxStatus {
     backend = commandExists("bwrap") ? requested : undefined;
   } else if (requested === "windows-wsl-bwrap" && process.platform === "win32") {
     backend = probeWindowsWsl(config).available ? requested : undefined;
+  } else if (requested === "windows-native" && windowsNativeAvailable()) {
+    if (config.windows?.identity === "appcontainer" && !windowsAppContainerAvailable()) {
+      if (config.mode === "strict" || !config.allowSoftFallback) throw new Error("当前 Windows 主机无法启动 AppContainer 进程，strict 模式拒绝执行");
+      return { backend: "soft", strong: false, warning: "AppContainer 能力探测失败，已降级为应用层防护模式" };
+    }
+    if (config.windows?.identity !== "appcontainer") {
+      if (config.mode === "strict" || !config.allowSoftFallback) throw new Error("Restricted Token 仅是兼容后备，不提供 AppContainer 等级文件隔离，strict 模式拒绝执行");
+      return { backend: requested, strong: false, warning: "Windows 原生后端使用 Restricted Token 兼容模式：进程和网络受控，但文件隔离依赖应用层工作区策略" };
+    }
+    backend = requested;
   } else if (requested === "docker" || requested === "podman") {
     backend = configuredContainer(requested);
   }
@@ -187,6 +202,8 @@ function minimalEnvironment(): NodeJS.ProcessEnv {
       ? {}
       : { SystemRoot: process.env.SystemRoot }),
     LANG: process.env.LANG ?? "C.UTF-8",
+    ...(process.env.TEMP === undefined ? {} : { TEMP: process.env.TEMP }),
+    ...(process.env.TMP === undefined ? {} : { TMP: process.env.TMP }),
   };
 }
 
@@ -196,6 +213,7 @@ export function buildSandboxedCommand(
   status: SandboxStatus,
   config: SandboxConfig,
   relativeCwd = ".",
+  timeoutSeconds = 120,
 ): SandboxedCommand {
   if (command.length === 0) throw new Error("沙箱命令不能为空");
   const resolvedWorkspace = path.resolve(workspace);
@@ -250,6 +268,26 @@ export function buildSandboxedCommand(
     const settings = windowsSettings(config);
     const wslWorkspace = toWslPath(resolvedWorkspace, settings.distribution);
     return buildWindowsWslCommand(command, wslWorkspace, settings, env, relativeCwd);
+  }
+
+  if (status.backend === "windows-native") {
+    const resourceConfig = config.resources ?? { maxProcesses: 64, memoryMb: 1024, cpuSeconds: 120 };
+    const networkConfig = config.network ?? { mode: "deny-all" as const, allowedCidrs: [] };
+    const allowedCidrs = normalizeAllowedIpv4Cidrs(networkConfig.allowedCidrs);
+    const network = {
+      mode: networkConfig.mode,
+      allowedCidrs,
+      blockedCidrs: networkConfig.mode === "allowlist" ? [...blockedIpv4Cidrs(allowedCidrs), "::/0"] : ["0.0.0.0/0", "::/0"],
+    };
+    return buildWindowsJobCommand(
+      command,
+      resolvedWorkspace,
+      path.resolve(workspace, relativeCwd),
+      { timeoutSeconds, maxProcesses: resourceConfig.maxProcesses, memoryBytes: resourceConfig.memoryMb * 1024 * 1024, cpuSeconds: resourceConfig.cpuSeconds },
+      network,
+      env,
+      config,
+    );
   }
 
   return {

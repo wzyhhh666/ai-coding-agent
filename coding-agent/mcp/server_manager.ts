@@ -9,7 +9,7 @@ import { authorizationHeader, CredentialStore } from "./credentials.ts";
 import { refreshOAuthToken } from "./oauth.ts";
 import type { McpDiscoveredTool, McpServerConfig, McpServerSnapshot } from "./types.ts";
 import type { SandboxConfig } from "../config.ts";
-import { createSandboxExecutionPlan } from "../tools/sandbox_policy.ts";
+import { createSandboxExecutionPlan, sandboxPlanSummary } from "../tools/sandbox_policy.ts";
 import { getWorkspaceRoot } from "../tools/_common.ts";
 
 type ConnectedServer = {
@@ -17,6 +17,7 @@ type ConnectedServer = {
   client?: Client;
   tools: McpDiscoveredTool[];
   status: McpServerSnapshot;
+  sandboxPolicy?: Record<string, unknown>;
 };
 
 function objectValue(value: unknown): Record<string, unknown> {
@@ -120,7 +121,7 @@ export class McpServerManager {
     const header = authorizationHeader(credential);
     const networkPolicy = config.url === undefined ? undefined : new McpNetworkPolicy(config.allowedOrigins);
     const stdioPlan = config.transport === "stdio"
-      ? createSandboxExecutionPlan("mcp-stdio", [config.command!, ...config.args], getWorkspaceRoot(), this.sandboxConfig)
+      ? createSandboxExecutionPlan("mcp-stdio", [config.command!, ...config.args], getWorkspaceRoot(), this.sandboxConfig, ".", 0)
       : undefined;
     const stdioEnvironment = stdioPlan === undefined
       ? undefined
@@ -153,7 +154,7 @@ export class McpServerManager {
       const handler: ToolHandler = async (args) => {
         const response = await client.callTool({ name, arguments: args });
         return {
-          mcp: { server_id: config.id, tool: name, is_error: response.isError === true },
+          mcp: { server_id: config.id, tool: name, is_error: response.isError === true, ...(stdioPlan === undefined ? {} : { sandbox_policy: sandboxPlanSummary(stdioPlan) }) },
           output: safeResult(response.content),
           ...(response.structuredContent === undefined ? {} : { structured_content: response.structuredContent }),
         };
@@ -172,7 +173,8 @@ export class McpServerManager {
       config,
       client,
       tools,
-      status: { id: config.id, displayName: config.displayName, transport: config.transport, status: "connected", origin: config.url === undefined ? undefined : new URL(config.url).origin, toolCount: tools.length },
+      status: { id: config.id, displayName: config.displayName, transport: config.transport, status: "connected", origin: config.url === undefined ? undefined : new URL(config.url).origin, toolCount: tools.length, ...(stdioPlan === undefined ? {} : { sandboxPolicy: sandboxPlanSummary(stdioPlan) }) },
+      ...(stdioPlan === undefined ? {} : { sandboxPolicy: sandboxPlanSummary(stdioPlan) }),
     });
   }
 

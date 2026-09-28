@@ -73,6 +73,7 @@ export async function runCommand(
       workspaceRoot,
       sandbox,
       relativeCwd,
+      timeout,
     );
     const prepared = plan.prepared;
     const result = await new Promise<CommandData>((resolve, reject) => {
