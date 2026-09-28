@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-export const CURRENT_SCHEMA_VERSION = 9;
+export const CURRENT_SCHEMA_VERSION = 12;
 export const STATE_DIRECTORY_MODE = 0o700;
 export const STATE_DATABASE_MODE = 0o600;
 
@@ -366,6 +366,116 @@ const MIGRATIONS: Migration[] = [
       ON skill_drafts(workspace_key, status, updated_at DESC);
     `,
   },
+  {
+    version: 10,
+    sql: `
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        workspace_path TEXT NOT NULL,
+        workspace_key TEXT NOT NULL,
+        objective TEXT NOT NULL,
+        scope_json TEXT NOT NULL,
+        non_goals_json TEXT NOT NULL,
+        constraints_json TEXT NOT NULL,
+        acceptance_criteria_json TEXT NOT NULL,
+        clarification_questions_json TEXT NOT NULL,
+        status TEXT NOT NULL
+          CHECK (status IN (
+            'created', 'analyzing', 'planned', 'executing', 'verifying',
+            'repairing', 'paused', 'cancelled', 'blocked', 'completed', 'failed'
+          )),
+        current_step_id TEXT,
+        status_reason TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX tasks_session_updated_idx
+      ON tasks(session_id, updated_at DESC, created_at DESC);
+
+      CREATE INDEX tasks_workspace_updated_idx
+      ON tasks(workspace_key, updated_at DESC, created_at DESC);
+
+      CREATE TABLE task_steps (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL,
+        kind TEXT NOT NULL
+          CHECK (kind IN ('analysis', 'implementation', 'testing', 'verification')),
+        title TEXT NOT NULL,
+        description TEXT NOT NULL,
+        status TEXT NOT NULL
+          CHECK (status IN ('pending', 'in_progress', 'completed', 'failed')),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+        UNIQUE (task_id, sequence)
+      );
+
+      CREATE INDEX task_steps_task_sequence_idx
+      ON task_steps(task_id, sequence);
+    `,
+  },
+  {
+    version: 11,
+    sql: `
+      ALTER TABLE turns ADD COLUMN task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL;
+      CREATE INDEX turns_task_sequence_idx ON turns(task_id, sequence);
+      CREATE TABLE task_verifications (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        step_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        command_json TEXT NOT NULL,
+        cwd TEXT,
+        timeout_ms INTEGER NOT NULL,
+        required INTEGER NOT NULL CHECK (required IN (0, 1)),
+        status TEXT NOT NULL CHECK (status IN ('pending', 'passed', 'failed', 'timed_out', 'skipped')),
+        exit_code INTEGER,
+        stdout TEXT NOT NULL,
+        stderr TEXT NOT NULL,
+        started_at INTEGER,
+        completed_at INTEGER,
+        FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+        FOREIGN KEY (step_id) REFERENCES task_steps(id) ON DELETE CASCADE
+      );
+      CREATE INDEX task_verifications_task_idx ON task_verifications(task_id, step_id);
+    `,
+  },
+  {
+    version: 12,
+    sql: `
+      CREATE TABLE task_runtime (
+        task_id TEXT PRIMARY KEY,
+        current_turn_id TEXT,
+        turn_count INTEGER NOT NULL DEFAULT 0,
+        token_used INTEGER NOT NULL DEFAULT 0,
+        started_at INTEGER,
+        last_progress_at INTEGER,
+        max_turns INTEGER,
+        max_tokens INTEGER,
+        max_duration_seconds INTEGER,
+        max_repair_attempts INTEGER NOT NULL DEFAULT 3,
+        repair_attempts INTEGER NOT NULL DEFAULT 0,
+        pause_reason TEXT,
+        cancel_reason TEXT,
+        FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+      );
+      CREATE TABLE task_repairs (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        step_id TEXT NOT NULL,
+        attempt INTEGER NOT NULL,
+        failure_summary TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+        FOREIGN KEY (step_id) REFERENCES task_steps(id) ON DELETE CASCADE
+      );
+      CREATE INDEX task_repairs_task_idx ON task_repairs(task_id, attempt);
+    `,
+  },
 ];
 
 export function stateDatabasePath(): string {
@@ -488,6 +598,11 @@ function validateCurrentSchema(database: DatabaseSync): void {
   const fileChangeEventColumns = tableColumns(database, "file_change_events");
   const skillAuditColumns = tableColumns(database, "skill_audit_events");
   const skillDraftColumns = tableColumns(database, "skill_drafts");
+  const taskColumns = tableColumns(database, "tasks");
+  const taskStepColumns = tableColumns(database, "task_steps");
+  const taskVerificationColumns = tableColumns(database, "task_verifications");
+  const taskRuntimeColumns = tableColumns(database, "task_runtime");
+  const taskRepairColumns = tableColumns(database, "task_repairs");
   if (
     !sessionColumns.has("workspace_key") ||
     !turnColumns.has("termination_reason") ||
@@ -502,6 +617,22 @@ function validateCurrentSchema(database: DatabaseSync): void {
     !skillDraftColumns.has("status") ||
     !skillDraftColumns.has("workspace_key") ||
     !skillDraftColumns.has("redaction_findings_json") ||
+    !taskColumns.has("acceptance_criteria_json") ||
+    !taskColumns.has("clarification_questions_json") ||
+    !taskColumns.has("status_reason") ||
+    !taskStepColumns.has("kind") ||
+    !taskStepColumns.has("status") ||
+    !taskVerificationColumns.has("command_json") ||
+    !taskVerificationColumns.has("status") ||
+    !taskRuntimeColumns.has("turn_count") ||
+    !taskRuntimeColumns.has("max_repair_attempts") ||
+    !taskRepairColumns.has("failure_summary") ||
+    !schemaObjectExists(database, "index", "tasks_session_updated_idx") ||
+    !schemaObjectExists(database, "index", "tasks_workspace_updated_idx") ||
+    !schemaObjectExists(database, "index", "task_steps_task_sequence_idx") ||
+    !schemaObjectExists(database, "index", "turns_task_sequence_idx") ||
+    !schemaObjectExists(database, "index", "task_verifications_task_idx") ||
+    !schemaObjectExists(database, "index", "task_repairs_task_idx") ||
     !schemaObjectExists(database, "index", "skill_drafts_status_updated_idx") ||
     !schemaObjectExists(database, "index", "skill_audit_events_turn_created_idx") ||
     !schemaObjectExists(

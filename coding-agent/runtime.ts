@@ -40,7 +40,7 @@ export function compactionItem(summary: string): ResponseInputItem {
 }
 
 export type SessionRecorder = {
-  startTurn(userInput: string, workspaceBaseline?: WorkspaceBaseline): Promise<string>;
+  startTurn(userInput: string, workspaceBaseline?: WorkspaceBaseline, taskId?: string): Promise<string>;
   appendItem(turnId: string, item: ResponseInputItem): Promise<void>;
   appendModelResponse?(
     turnId: string,
@@ -92,6 +92,7 @@ export type ReActRuntimeOptions = {
 export type RunTurnOptions = {
   signal?: AbortSignal;
   explicitSkillContext?: string;
+  taskId?: string;
 };
 
 export class TurnCancelledError extends Error {
@@ -411,7 +412,7 @@ export class ReActRuntime {
     try {
       throwIfAborted(options.signal);
       const workspaceBaseline = await this.tools.captureWorkspaceBaseline();
-      const startedTurnId = await this.startRecordedTurn(userInput, workspaceBaseline);
+      const startedTurnId = await this.startRecordedTurn(userInput, workspaceBaseline, options.taskId);
       turnId = startedTurnId;
       if (this.skillAudit !== undefined && startedTurnId !== undefined) {
         this.skillAudit.beginTurn(startedTurnId);
@@ -687,9 +688,10 @@ export class ReActRuntime {
   private async startRecordedTurn(
     userInput: string,
     workspaceBaseline: WorkspaceBaseline,
+    taskId?: string,
   ): Promise<string | undefined> {
     try {
-      return await this.recorder?.startTurn(userInput, workspaceBaseline);
+      return await this.recorder?.startTurn(userInput, workspaceBaseline, taskId);
     } catch (error) {
       throw persistenceFailure(error);
     }

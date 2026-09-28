@@ -85,6 +85,14 @@ test("状态数据库初始化 Schema、PRAGMA 和文件权限", async () => {
       "skill_audit_events_turn_created_idx",
       "skill_drafts",
       "skill_drafts_status_updated_idx",
+      "tasks",
+      "tasks_session_updated_idx",
+      "tasks_workspace_updated_idx",
+      "task_steps",
+      "task_steps_task_sequence_idx",
+      "task_verifications",
+      "task_verifications_task_idx",
+      "turns_task_sequence_idx",
     ]) {
       assert.equal(schemaNames.has(name), true, `缺少数据库对象: ${name}`);
     }

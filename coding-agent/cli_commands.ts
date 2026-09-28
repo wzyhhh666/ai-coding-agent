@@ -8,6 +8,12 @@ export type CliInput =
   | { type: "list-skills" }
   | { type: "invoke-skill"; skillName: string; input: string }
   | { type: "list-sessions" }
+  | { type: "start-managed-task"; objective: string }
+  | { type: "managed-task-status" }
+  | { type: "run-managed-task" }
+  | { type: "pause-managed-task" }
+  | { type: "resume-managed-task" }
+  | { type: "cancel-managed-task" }
   | { type: "new-session"; title?: string }
   | { type: "resume-session"; sessionId?: string }
   | { type: "continue-turn"; turnId: string }
@@ -57,6 +63,26 @@ export function parseCliInput(value: string): CliInput {
     return argument.length === 0
       ? { type: "list-sessions" }
       : { type: "invalid", message: "用法: /sessions" };
+  }
+  if (command === "/task") {
+    const taskSeparator = argument.indexOf(" ");
+    const action = (taskSeparator === -1 ? argument : argument.slice(0, taskSeparator))
+      .toLocaleLowerCase();
+    const taskArgument = taskSeparator === -1 ? "" : argument.slice(taskSeparator + 1).trim();
+    if (action === "start") {
+      return taskArgument.length === 0
+        ? { type: "invalid", message: "用法: /task start <目标>" }
+        : { type: "start-managed-task", objective: taskArgument };
+    }
+    if (action === "status") {
+      return taskArgument.length === 0
+        ? { type: "managed-task-status" }
+        : { type: "invalid", message: "用法: /task status" };
+    }
+    if (["run", "pause", "resume", "cancel"].includes(action) && taskArgument.length === 0) {
+      return { type: `${action}-managed-task` as "run-managed-task" | "pause-managed-task" | "resume-managed-task" | "cancel-managed-task" };
+    }
+    return { type: "invalid", message: "用法: /task start <目标> | /task status" };
   }
   if (command === "/skills") {
     return argument.length === 0

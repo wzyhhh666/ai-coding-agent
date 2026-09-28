@@ -10,6 +10,15 @@ test("parseCliInput 区分任务、退出和会话命令", () => {
   });
   assert.deepEqual(parseCliInput(" QUIT "), { type: "exit" });
   assert.deepEqual(parseCliInput("/sessions"), { type: "list-sessions" });
+  assert.deepEqual(parseCliInput("/task start 增加配置校验"), {
+    type: "start-managed-task",
+    objective: "增加配置校验",
+  });
+  assert.deepEqual(parseCliInput("/task status"), { type: "managed-task-status" });
+  assert.deepEqual(parseCliInput("/task run"), { type: "run-managed-task" });
+  assert.deepEqual(parseCliInput("/task pause"), { type: "pause-managed-task" });
+  assert.deepEqual(parseCliInput("/task resume"), { type: "resume-managed-task" });
+  assert.deepEqual(parseCliInput("/task cancel"), { type: "cancel-managed-task" });
   assert.deepEqual(parseCliInput("/new 重构任务"), {
     type: "new-session",
     title: "重构任务",
@@ -75,5 +84,13 @@ test("parseCliInput 为缺少参数和未知命令返回明确错误", () => {
   assert.deepEqual(parseCliInput("/retry first second"), {
     type: "invalid",
     message: "用法: /retry <turn-id>",
+  });
+  assert.deepEqual(parseCliInput("/task start"), {
+    type: "invalid",
+    message: "用法: /task start <目标>",
+  });
+  assert.deepEqual(parseCliInput("/task status extra"), {
+    type: "invalid",
+    message: "用法: /task status",
   });
 });

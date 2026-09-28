@@ -602,6 +602,7 @@ export class SessionStore {
     sessionId: string,
     userInput: string,
     workspaceBaseline?: WorkspaceBaseline,
+    taskId?: string,
   ): string {
     return this.transaction(() => {
       this.requireSessionForWorkspace(sessionId);
@@ -611,8 +612,8 @@ export class SessionStore {
       this.database.prepare(`
         INSERT INTO turns
           (id, session_id, sequence, user_input, status, started_at,
-           workspace_baseline_json)
-        VALUES (?, ?, ?, ?, 'running', ?, ?)
+          workspace_baseline_json, task_id)
+        VALUES (?, ?, ?, ?, 'running', ?, ?, ?)
       `).run(
         turnId,
         sessionId,
@@ -622,6 +623,7 @@ export class SessionStore {
         workspaceBaseline === undefined
           ? null
           : JSON.stringify(workspaceBaseline),
+        taskId ?? null,
       );
       this.insertItem(
         sessionId,
@@ -1080,8 +1082,8 @@ export class SessionStore {
   recorder(sessionId: string): SessionRecorder {
     this.requireSessionForWorkspace(sessionId);
     return {
-      startTurn: async (userInput, workspaceBaseline) => {
-        return this.startTurn(sessionId, userInput, workspaceBaseline);
+      startTurn: async (userInput, workspaceBaseline, taskId) => {
+        return this.startTurn(sessionId, userInput, workspaceBaseline, taskId);
       },
       appendItem: async (turnId, item) => this.appendItem(turnId, item),
       appendModelResponse: async (turnId, items, metadata) => {

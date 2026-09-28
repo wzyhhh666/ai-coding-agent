@@ -45,6 +45,9 @@ import {
   rollbackGitWorkspaceToCheckpoint,
 } from "./workspace_rollback.ts";
 import { McpServerManager } from "./mcp/server_manager.ts";
+import { createPlannedTask, type PreparedTask } from "./task/bootstrap.ts";
+import { TaskStore } from "./task/store.ts";
+import { executeTask } from "./task/executor.ts";
 
 export type CliArguments = {
   workspace: string;
@@ -155,9 +158,11 @@ export async function runCli(): Promise<void> {
   let mcpLoaded = false;
   let database: DatabaseSync | undefined;
   let store: SessionStore | undefined;
+  let taskStore: TaskStore | undefined;
   let agent: ReActRuntime | undefined;
   let activeSessionId: string | undefined;
   const turnController = new CliTurnController();
+  let managedAbortController: AbortController | undefined;
   let closeActiveTextLine = () => undefined;
 
   const sessionInput = {
@@ -173,12 +178,26 @@ export async function runCli(): Promise<void> {
       const openedStore = new SessionStore(openedDatabase, workspacePath);
       database = openedDatabase;
       store = openedStore;
+      taskStore = new TaskStore(openedDatabase, workspacePath);
       console.warn(STATE_PRIVACY_NOTICE);
       return openedStore;
     } catch (error) {
       openedDatabase.close();
       throw error;
     }
+  }
+
+  async function requireTaskStore(): Promise<TaskStore> {
+    await requireStore();
+    if (taskStore === undefined) throw new Error("任务存储尚未初始化。");
+    return taskStore;
+  }
+
+  async function requireActiveSessionId(): Promise<string> {
+    if (activeSessionId !== undefined) return activeSessionId;
+    const runtimeSession = prepareRuntimeSession(await requireStore(), sessionInput);
+    activeSessionId = runtimeSession.session.id;
+    return activeSessionId;
   }
 
   async function activateSession(
@@ -234,7 +253,7 @@ export async function runCli(): Promise<void> {
     return restoredAgent;
   }
 
-  async function executeInput(input: string, explicitSkill?: LoadedSkill): Promise<void> {
+  async function executeInput(input: string, explicitSkill?: LoadedSkill, taskId?: string): Promise<void> {
     let textLineOpen = false;
     closeActiveTextLine = () => {
       if (!textLineOpen) return;
@@ -256,6 +275,7 @@ export async function runCli(): Promise<void> {
           },
           {
             signal,
+            ...(taskId === undefined ? {} : { taskId }),
             ...(explicitSkill === undefined
               ? {}
               : {
@@ -275,6 +295,39 @@ export async function runCli(): Promise<void> {
       });
     } finally {
       closeActiveTextLine = () => undefined;
+    }
+  }
+
+  async function runManagedTask(): Promise<void> {
+    const sessionId = await requireActiveSessionId();
+    const managedStore = await requireTaskStore();
+    const task = managedStore.findLatestTask(sessionId);
+    if (task === undefined) throw new Error("当前会话没有任务计划。");
+    managedAbortController = new AbortController();
+    try {
+      const result = await executeTask(managedStore, task, {
+        signal: managedAbortController.signal,
+        maxTurns: 20,
+        maxRepairAttempts: 3,
+        maxDurationMs: 30 * 60 * 1000,
+        commandExecutor: async (args, cwd, timeout) => {
+          if (activeToolRegistry === undefined) throw new Error("工具注册表尚未准备完成。");
+          return activeToolRegistry.execute("run_command", JSON.stringify({ args, cwd: cwd ?? ".", timeout: Math.ceil((timeout ?? 120000) / 1000) }));
+        },
+        runTurn: async (input, taskId, signal) => executeInput(input, undefined, taskId),
+      });
+      showManagedTask({ task: result, steps: managedStore.listTaskSteps(result.id) });
+      const summary = managedStore.buildResult(result.id);
+      console.log(`结果摘要: ${summary.summary}`);
+      if (summary.unresolvedIssues.length > 0) console.log(`未解决问题: ${summary.unresolvedIssues.join("；")}`);
+    } catch (error) {
+      if (managedAbortController.signal.aborted) {
+        const current = managedStore.getTask(task.id);
+        if (current.status !== "cancelled") managedStore.pauseTask(task.id, "任务被用户中断");
+      }
+      throw error;
+    } finally {
+      managedAbortController = undefined;
     }
   }
 
@@ -428,6 +481,44 @@ export async function runCli(): Promise<void> {
     return response.output_text;
   }
 
+  async function taskAnalysisModel(prompt: string): Promise<string> {
+    const response = await client.responses.create({
+      model: runtimeConfig.provider.model,
+      instructions: "你是 Coding Agent 任务分析器。严格按用户要求只输出 JSON。",
+      input: [{ type: "message", role: "user", content: prompt }],
+      store: false,
+      include: ["reasoning.encrypted_content"],
+      stream: false,
+    });
+    if (Symbol.asyncIterator in response) throw new Error("任务分析不接受流式响应。");
+    if (response.status !== "completed" || response.output_text.length === 0) {
+      throw new Error("模型没有完成任务分析。");
+    }
+    return response.output_text;
+  }
+
+  function showManagedTask(prepared: PreparedTask): void {
+    const { task, steps } = prepared;
+    console.log(`\nTask: ${task.id} | ${task.status}`);
+    console.log(`目标: ${task.objective}`);
+    if (task.statusReason !== null) console.log(`状态原因: ${task.statusReason}`);
+    if (task.scope.length > 0) console.log(`范围: ${task.scope.join("；")}`);
+    if (task.nonGoals.length > 0) console.log(`非目标: ${task.nonGoals.join("；")}`);
+    if (task.constraints.length > 0) console.log(`约束: ${task.constraints.join("；")}`);
+    if (task.acceptanceCriteria.length > 0) {
+      console.log("验收标准:");
+      task.acceptanceCriteria.forEach((criterion, index) => console.log(`  ${index + 1}. ${criterion}`));
+    }
+    if (task.clarificationQuestions.length > 0) {
+      console.log("需要补充:");
+      task.clarificationQuestions.forEach((question, index) => console.log(`  ${index + 1}. ${question}`));
+    }
+    if (steps.length > 0) {
+      console.log("执行计划:");
+      steps.forEach((step) => console.log(`  ${step.sequence}. [${step.kind}] ${step.title}：${step.description}`));
+    }
+  }
+
   function showSkills(): void {
     const skills = skillCatalog.listMetadata();
     if (skills.length === 0) {
@@ -469,6 +560,7 @@ export async function runCli(): Promise<void> {
       if (action === "cancelled") {
         closeActiveTextLine();
         stdout.write("\n正在取消当前任务...\n");
+        managedAbortController?.abort();
         return;
       }
       if (action === "closing") {
@@ -483,6 +575,8 @@ export async function runCli(): Promise<void> {
         if (command.type === "help") {
           console.log(
             "/sessions 列出会话 | /new [标题] 新建会话 | " +
+              "/task start <目标> 创建任务计划 | /task status 查看任务计划 | " +
+              "/task run 执行计划 | /task pause 暂停 | /task resume 恢复 | /task cancel 取消 | " +
               "/resume [session-id] 恢复会话 | /switch <session-id> " +
               "切换会话 | /continue <turn-id> 继续 | " +
               "/retry <turn-id> 重试 | /rollback <turn-id> 回滚检查点 | " +
@@ -512,6 +606,62 @@ export async function runCli(): Promise<void> {
         }
         if (command.type === "install-skill") {
           await installSkillFromCli(command.source, command.target);
+          return;
+        }
+
+        if (command.type === "start-managed-task") {
+          const sessionId = await requireActiveSessionId();
+          const prepared = await createPlannedTask(
+            await requireTaskStore(),
+            sessionId,
+            command.objective,
+            taskAnalysisModel,
+          );
+          showManagedTask(prepared);
+          return;
+        }
+
+        if (command.type === "managed-task-status") {
+          const sessionId = await requireActiveSessionId();
+          const managedStore = await requireTaskStore();
+          const task = managedStore.findLatestTask(sessionId);
+          if (task === undefined) {
+            console.log("当前会话没有任务计划。");
+            return;
+          }
+          showManagedTask({ task, steps: managedStore.listTaskSteps(task.id) });
+          return;
+        }
+        if (command.type === "run-managed-task") {
+          await runManagedTask();
+          return;
+        }
+        if (command.type === "pause-managed-task") {
+          const sessionId = await requireActiveSessionId();
+          const task = (await requireTaskStore()).findLatestTask(sessionId);
+          if (task === undefined) throw new Error("当前会话没有任务计划。");
+          (await requireTaskStore()).pauseTask(task.id);
+          managedAbortController?.abort();
+          console.log(`任务已暂停：${task.id}`);
+          return;
+        }
+        if (command.type === "resume-managed-task") {
+          const sessionId = await requireActiveSessionId();
+          const managedStore = await requireTaskStore();
+          const task = managedStore.findLatestTask(sessionId);
+          if (task === undefined) throw new Error("当前会话没有任务计划。");
+          managedStore.resumeTask(task.id);
+          console.log(`任务已恢复：${task.id}`);
+          return;
+        }
+        if (command.type === "cancel-managed-task") {
+          const sessionId = await requireActiveSessionId();
+          const managedStore = await requireTaskStore();
+          const task = managedStore.findLatestTask(sessionId);
+          if (task === undefined) throw new Error("当前会话没有任务计划。");
+          managedStore.cancelTask(task.id);
+          managedAbortController?.abort();
+          console.log(`任务已取消：${task.id}`);
           return;
         }
 

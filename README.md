@@ -39,6 +39,9 @@
 - MCP 远程身份（阶段二）：支持用户级 credential profile、API Key/Bearer 凭据、AES-256-GCM 加密凭据文件，以及 OAuth 2.1 Authorization Code + PKCE 的元数据发现、Token 交换、刷新和 state 校验。
 - MCP 受控网络（阶段三）：后端支持 Origin/DNS/IP 校验、同源重定向限制、请求超时、响应大小、并发控制、GET/HEAD 有限指数退避和 OAuth loopback 回调；不增加复杂 CLI。
 - Windows 沙箱已完成：命令、Skill 脚本和本地 MCP stdio 共用执行计划；Job Object 控制进程树、CPU、内存、进程数和超时；AppContainer 在执行前探测，Restricted Token 仅作为明确标记的兼容后备；目标 IPv4 CIDR allowlist 通过临时 Windows Firewall/WFP 规则强制并绑定宿主 PID 租约。
+- 任务定义与计划：支持将开发目标分析为范围、非目标、约束、验收标准和四类执行步骤，并以 `Session → Task → TaskStep` 结构持久化；信息不足时任务进入 `blocked` 并保留澄清问题。
+- 任务执行与验证：支持 `/task run` 按计划驱动现有 Runtime，测试/验证步骤通过 `run_command` 执行并保存退出码、输出和状态；验证失败会停止当前任务，不提前标记完成。
+- 长任务控制：支持任务跨步骤/Turn 推进、`/task pause`、`/task resume`、`/task cancel` 和 Ctrl+C 安全中断，已完成工具结果和步骤状态保留在 SQLite 中。
 
 > CLI 支持自动接续和显式切换；会话重命名与删除命令尚未实现。
 
@@ -108,6 +111,12 @@ Runtime 的 `runTurn` 支持通过可选 `AbortSignal` 取消当前任务。取�
 | `/switch <session-id>` | 恢复并切换到指定会话 |
 | `/continue <turn-id>` | 使用失败或中断 Turn 的安全上下文，并输入新的继续指令 |
 | `/retry <turn-id>` | 使用失败或中断 Turn 的原始用户目标创建新的重试 Turn |
+| `/task start <目标>` | 分析开发目标并创建可恢复的任务规格和执行计划，不执行代码修改 |
+| `/task status` | 查看当前会话最近任务的目标、状态、验收标准和执行步骤 |
+| `/task run` | 执行当前会话最近的已计划任务 |
+| `/task pause` | 暂停当前任务，保留已完成步骤 |
+| `/task resume` | 从暂停任务的当前步骤继续 |
+| `/task cancel` | 取消当前任务 |
 | `/skill-install <来源> [user\|repository]` | 预览并安装本地目录、压缩包或 Git 仓库中的 Skill，默认安装到用户级目录 |
 | `/skills` | 列出 Skill 来源、模型调用、用户调用和路径限制状态 |
 | `$skill-name [任务]` 或 `/skill-name [任务]` | 显式加载并在当前 Turn 使用指定 Skill |
@@ -217,6 +226,7 @@ coding-agent/
 ├── turn_lifecycle.ts         # Turn 状态、终止原因与契约校验
 ├── sqlite.ts                 # SQLite Schema 与迁移
 ├── session/                  # SessionStore、Turn 与 Item 持久化
+├── task/                     # Task 定义、分析、计划、持久化与恢复装配
 ├── mcp/                      # MCP Server 配置、Transport、发现、网络目标校验与工具适配
 ├── sandbox/native/           # Windows AppContainer/Restricted Token/Job Object 原生辅助组件
 ├── tools/sandbox_policy.ts   # 统一命令、Skill 和 MCP stdio 的沙箱执行计划
@@ -235,7 +245,16 @@ coding-agent/
 
 Windows 沙箱后续阶段已完成：统一执行计划现已覆盖 WSL 强隔离、Windows Job Object、AppContainer 能力探测、Restricted Token 兼容后备、目标 CIDR 网络强制、资源预算、异常租约恢复和 MCP stdio 审计；任何能力缺失或降级都会明确报告，strict 不会静默放行。
 
+Agent 执行闭环阶段一已完成：任务目标可通过一次分析调用生成结构化规格与计划，Task 和 TaskStep 随 Session 持久化并受工作区隔离；需求不足会进入 `blocked`，本阶段不会自动修改代码。
+
 ## 更新记录
+
+### 2026-09-28
+
+- feat | 完成 Agent 执行闭环阶段一，新增 Task/TaskStep 持久化、结构化需求分析、四类步骤计划、需求澄清阻塞和 `/task start`、`/task status` 命令。
+- feat | 完成 Agent 执行闭环阶段二和阶段三，新增 TaskStep 驱动 Runtime、验证命令与结果持久化、Task/Turn 关联、任务跨步骤执行以及 `/task run`、暂停、恢复、取消和 Ctrl+C 控制。
+- feat | 收尾 Agent 执行闭环开发计划，新增任务级运行时预算与进度、验证失败自动修复、修复次数熔断、严格完成判定和基础结果摘要。
+- docs | 新增阶段一开发记录，明确数据模型、状态边界、一次任务循环和后续阶段接口。
 
 ### 2026-09-27
 
